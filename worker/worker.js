@@ -1,78 +1,70 @@
 /**
  * ============================================================
- * worker.js — Forecast sync worker
+ * worker.js — Forecast sync worker (end-to-end encrypted)
  * ============================================================
  *
- * Auth, sessions, invites, Google linking and rate limiting are carried
- * over from Retrograde (the care log) with the same guarantees:
- *   - opaque 256-bit session tokens, never Google ID tokens
- *   - Google `sub` is the join key, never email
- *   - one access predicate, fails closed
- *   - entries are write-once; edits supersede, deletes are tombstones
+ * This worker is built to know as little as possible.
  *
- * What is different here is the shape of a "log". Each forecast has
- * exactly two people: the OWNER who created it and invited someone, and
- * the SUBJECT who accepted. One owner can have many forecasts (one per
- * person they invite), and each subject only ever sees her own.
+ *   - Every entry is encrypted in the browser. The worker stores an
+ *     opaque blob plus the minimum it needs to route it: who wrote it,
+ *     who may receive it, and what it replaces. It never sees whether an
+ *     entry is a period start, a reading or a note, or what date it is for.
+ *   - Accounts are a nickname. No email, no full name, no avatar.
+ *   - Sign-in is a recovery key, or optionally Google. The worker stores a
+ *     hash of the login secret and a keyed hash of the Google subject id,
+ *     never the raw values.
+ *   - IP addresses appear only as short keyed hashes inside rate-limit
+ *     counters that expire within minutes. Sessions store no user agent.
+ *
+ * Auth shape, invites, the single access predicate and write-once
+ * entries are carried over from Retrograde.
  *
  * ── SETUP ────────────────────────────────────────────────────
- *
- * 1. KV NAMESPACE — create one, bind it as: FORECAST
- *
- * 2. VARS:
- *      ALLOWED_ORIGINS   https://you.github.io,http://localhost:8788
- *      GOOGLE_CLIENT_ID  xxxx.apps.googleusercontent.com   (optional)
- *
- * 3. SECRET:
- *      SIGNUP_TOKEN      long random string. Required to create an
- *                        OWNER account. Invited people never need it.
+ *   KV binding        FORECAST
+ *   Vars              ALLOWED_ORIGINS     https://you.github.io
+ *                     GOOGLE_CLIENT_ID    (optional)
+ *                     TURNSTILE_SITE_KEY  (optional, recommended)
+ *   Secrets           ID_PEPPER           long random string (required)
+ *                     TURNSTILE_SECRET    (optional, pairs with site key)
  *
  * ── KEY LAYOUT ───────────────────────────────────────────────
- *
- *   p:<personId>                    person record
- *   c:google:<sub>                  → personId
+ *   p:<personId>                    { id, displayName, wrappedDataKey, creds[], createdAt }
+ *   c:rk:<sha256(loginSecret)>      → personId
+ *   c:g:<hmac(googleSub)>           → personId
  *   pf:<personId>                   → [forecastId, ...]
- *   s:<sessionId>                   session (TTL)
- *   i:<inviteToken>                 invite  (TTL)
+ *   s:<sessionId>                   { personId, createdAt }            (TTL)
+ *   i:<inviteToken>                 invite                             (TTL)
+ *   rl:<bucket>                     counter                            (TTL)
  *
- *   f:<fid>:meta                    forecast record
+ *   f:<fid>:meta                    { id, ownerId, ownerName, subjectId, subjectName,
+ *                                     kcv, sharedEnc, ownerEnc, inviteToken, createdAt }
  *   f:<fid>:m:<personId>            membership { role, status }
- *   f:<fid>:e:<ts13>:<o|s>:<uuid>   entry — WRITE ONCE. The o/s tag is the
- *                                   author's role, so "delete everything
- *                                   I shared" is a list + delete with no
- *                                   reads.
- *   f:<fid>:eid:<uuid>              → full entry key (idempotency index)
- *   f:<fid>:last                    ts13 of the latest write (cheap poll)
- *
- * ── VISIBILITY ───────────────────────────────────────────────
- *   shared   both people on the forecast see it
- *   private  only the author sees it
- *
- * That rule is symmetric on purpose. The owner can keep notes she never
- * sees, and she can keep notes he never sees.
+ *   f:<fid>:k:<personId>            that member's wrapped forecast key
+ *   f:<fid>:e:<ts13>:<o|s>:<uuid>   entry, write-once, encrypted
+ *   f:<fid>:eid:<uuid>              → entry key
+ *   f:<fid>:last                    ts13 of latest write
  * ============================================================
  */
 
 const KV_BINDING = 'FORECAST';
 
-const SESSION_TTL     = 60 * 60 * 24 * 180;
-const INVITE_TTL      = 60 * 60 * 24 * 14;
-const AUTH_RATE_LIMIT = 30;
-const AUTH_RATE_WIN   = 60 * 15;
-const WRITE_RATE_LIMIT= 200;
-const WRITE_RATE_WIN  = 60 * 5;
-const MAX_BODY        = 256 * 1024;
-const MAX_ENTRY_TEXT  = 6000;
-const MAX_FIELDS_JSON = 4000;
-const SYNC_PAGE       = 400;
+const SESSION_TTL      = 60 * 60 * 24 * 180;
+const INVITE_TTL       = 60 * 60 * 24 * 14;
+const AUTH_RATE_LIMIT  = 30;
+const AUTH_RATE_WIN    = 60 * 15;
+const WRITE_RATE_LIMIT = 200;
+const WRITE_RATE_WIN   = 60 * 5;
+const INVITE_DAY_LIMIT = 20;
+const SIGNUP_IP_LIMIT  = 5;                  // new accounts per IP per hour
+const MAX_FORECASTS    = 12;                 // per owner
+const MAX_BODY         = 256 * 1024;
+const MAX_CT           = 16 * 1024;          // one encrypted entry
+const MAX_BLOB         = 2048;               // wrapped keys, kcv, settings blobs
+const SYNC_PAGE        = 400;
 
-const KINDS        = ['reading', 'note', 'period'];
-const VISIBILITIES = ['shared', 'private'];
-const RELATIONS    = ['partner', 'family', 'friend'];
+// ── responses ──────────────────────────────────────────────────────────────
 
-// ── Response helpers ───────────────────────────────────────────────────────
-
-function respond(body, status = 200, extra = {}) {
+function respond(body, status, extra = {}) {
   return new Response(body, { status, headers: { 'Content-Type': 'application/json', ...extra } });
 }
 const err = (msg, status, cors, extra = {}) => respond(JSON.stringify({ error: msg }), status, { ...cors, ...extra });
@@ -82,191 +74,188 @@ function buildCors(origin) {
   if (!origin) return {};
   return {
     'Access-Control-Allow-Origin':  origin,
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age':       '86400',
     'Vary':                         'Origin',
   };
 }
-
 function getAllowedOrigin(request, env) {
-  const origin  = request.headers.get('Origin') || '';
-  const allowed = (env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-  return allowed.includes(origin) ? origin : null;
+  const origin = request.headers.get('Origin') || '';
+  return (env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean).includes(origin) ? origin : null;
 }
 
-// ── Ids ────────────────────────────────────────────────────────────────────
+// ── small helpers ──────────────────────────────────────────────────────────
 
-function randomId(bytes = 16) {
-  const b = new Uint8Array(bytes);
-  crypto.getRandomValues(b);
-  return btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const enc = new TextEncoder();
+function b64url(bytes) {
+  return btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
+function randomId(bytes = 16) { return b64url(crypto.getRandomValues(new Uint8Array(bytes))); }
 const ts13 = (ms = Date.now()) => String(ms).padStart(13, '0');
-const isId = (s, min = 8, max = 128) =>
-  typeof s === 'string' && new RegExp(`^[A-Za-z0-9_-]{${min},${max}}$`).test(s);
-const isDate = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(Date.parse(s));
+const isId = (s, min = 8, max = 128) => typeof s === 'string' && new RegExp(`^[A-Za-z0-9_-]{${min},${max}}$`).test(s);
+const isBlob = (s, max = MAX_BLOB) => typeof s === 'string' && s.length >= 16 && s.length <= max && /^[A-Za-z0-9_-]+$/.test(s);
 
-// Constant-time-ish comparison for the signup secret.
-function safeEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
-  let r = 0;
-  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return r === 0;
+async function sha256(s) { return b64url(await crypto.subtle.digest('SHA-256', enc.encode(s))); }
+async function hmac(env, s) {
+  const key = await crypto.subtle.importKey('raw', enc.encode(env.ID_PEPPER), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return b64url(await crypto.subtle.sign('HMAC', key, enc.encode(s)));
 }
 
-// ── Rate limiting ──────────────────────────────────────────────────────────
+// Nicknames only. Short, single line, no addresses or links.
+function cleanNick(v) {
+  const s = String(v || '').replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 24);
+  if (!s) return null;
+  if (/@|https?:|www\./i.test(s)) return null;
+  return s;
+}
 
 async function rateLimit(env, bucket, limit, windowSecs) {
-  const kv    = env[KV_BINDING];
-  const key   = `rl:${bucket}`;
-  const count = parseInt((await kv.get(key)) || '0', 10);
-  if (count >= limit) return false;
-  await kv.put(key, String(count + 1), { expirationTtl: Math.max(60, windowSecs) });
+  const kv = env[KV_BINDING];
+  const key = `rl:${bucket}`;
+  const n = parseInt((await kv.get(key)) || '0', 10);
+  if (n >= limit) return false;
+  await kv.put(key, String(n + 1), { expirationTtl: Math.max(60, windowSecs) });
   return true;
 }
 
-// ── Google JWT (RS256) — unchanged from Retrograde ─────────────────────────
+// ── Turnstile ──────────────────────────────────────────────────────────────
 
-let _jwksCache = { keys: null, fetchedAt: 0 };
-
-async function getJwks() {
-  const now = Date.now();
-  if (_jwksCache.keys && now - _jwksCache.fetchedAt < 60 * 60 * 1000) return _jwksCache.keys;
-  const res = await fetch('https://www.googleapis.com/oauth2/v3/certs');
-  if (!res.ok) return _jwksCache.keys;
-  const jwks = await res.json();
-  _jwksCache = { keys: jwks.keys || [], fetchedAt: now };
-  return _jwksCache.keys;
+async function turnstileOk(env, token, ipHash) {
+  if (!env.TURNSTILE_SECRET) return true;      // not configured: dev or private use
+  if (typeof token !== 'string' || !token) return false;
+  const form = new FormData();
+  form.append('secret', env.TURNSTILE_SECRET);
+  form.append('response', token);
+  form.append('idempotency_key', crypto.randomUUID());
+  try {
+    const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body: form });
+    const j = await r.json();
+    return j.success === true;
+  } catch { return false; }
 }
 
-const b64urlJson = part => JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/')));
+// ── Google (RS256), unchanged verification ─────────────────────────────────
 
-async function verifyGoogleJWT(idToken, clientId) {
+let _jwks = { keys: null, at: 0 };
+async function getJwks() {
+  if (_jwks.keys && Date.now() - _jwks.at < 3600e3) return _jwks.keys;
+  const r = await fetch('https://www.googleapis.com/oauth2/v3/certs');
+  if (!r.ok) return _jwks.keys;
+  _jwks = { keys: (await r.json()).keys || [], at: Date.now() };
+  return _jwks.keys;
+}
+const b64urlJson = p => JSON.parse(atob(p.replace(/-/g, '+').replace(/_/g, '/')));
+async function verifyGoogleSub(idToken, clientId) {
   if (!clientId || typeof idToken !== 'string') return null;
   try {
-    const parts = idToken.split('.');
-    if (parts.length !== 3) return null;
-    const header  = b64urlJson(parts[0]);
-    const payload = b64urlJson(parts[1]);
-    const now     = Math.floor(Date.now() / 1000);
-    if (!payload.exp || payload.exp < now) return null;
+    const [h, p, s] = idToken.split('.');
+    const header = b64urlJson(h), payload = b64urlJson(p);
+    if (!payload.exp || payload.exp < Date.now() / 1000) return null;
     if (payload.aud !== clientId) return null;
     if (!['accounts.google.com', 'https://accounts.google.com'].includes(payload.iss)) return null;
-    if (!payload.sub) return null;
-
     const jwk = (await getJwks())?.find(k => k.kid === header.kid);
     if (!jwk) return null;
-    const key = await crypto.subtle.importKey('jwk', jwk,
-      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
-    const sig = Uint8Array.from(atob(parts[2].replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
-    const valid = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, sig,
-      new TextEncoder().encode(`${parts[0]}.${parts[1]}`));
-    if (!valid) return null;
-    return { sub: payload.sub, email: payload.email || null, picture: payload.picture || null };
-  } catch (e) {
-    console.error('[auth] verifyGoogleJWT:', e);
-    return null;
-  }
+    const key = await crypto.subtle.importKey('jwk', jwk, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+    const sig = Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    const valid = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, sig, enc.encode(`${h}.${p}`));
+    // Only the subject id is used, and only to compute a keyed hash.
+    // Email, name and picture in the token are ignored.
+    return valid && payload.sub ? payload.sub : null;
+  } catch { return null; }
 }
 
-// ── Sessions ───────────────────────────────────────────────────────────────
+// ── sessions and people ────────────────────────────────────────────────────
 
-async function createSession(env, personId, request) {
+async function createSession(env, personId) {
   const id = randomId(32);
-  await env[KV_BINDING].put(`s:${id}`, JSON.stringify({
-    personId, createdAt: Date.now(),
-    userAgent: (request.headers.get('User-Agent') || '').slice(0, 200),
-  }), { expirationTtl: SESSION_TTL });
+  await env[KV_BINDING].put(`s:${id}`, JSON.stringify({ personId, createdAt: Date.now() }), { expirationTtl: SESSION_TTL });
   return id;
 }
-
+function bearer(request) {
+  const h = request.headers.get('Authorization') || '';
+  const sid = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+  return isId(sid, 16, 128) ? sid : null;
+}
 async function resolveSession(request, env) {
-  const hdr = request.headers.get('Authorization') || '';
-  const sid = hdr.startsWith('Bearer ') ? hdr.slice(7).trim() : '';
-  if (!isId(sid, 16, 128)) return null;
-  const raw = await env[KV_BINDING].get(`s:${sid}`, { type: 'json' });
-  if (!raw?.personId) return null;
-  const person = await env[KV_BINDING].get(`p:${raw.personId}`, { type: 'json' });
-  if (!person || person.active === false) return null;
-  return { sessionId: sid, personId: raw.personId, person };
+  const sid = bearer(request);
+  if (!sid) return null;
+  const s = await env[KV_BINDING].get(`s:${sid}`, { type: 'json' });
+  if (!s?.personId) return null;
+  const person = await env[KV_BINDING].get(`p:${s.personId}`, { type: 'json' });
+  if (!person) return null;
+  return { sessionId: sid, personId: s.personId, person };
 }
-
-async function createPerson(env, displayName, extra = {}) {
-  const person = {
-    id: randomId(16),
-    displayName: String(displayName || 'Someone').trim().slice(0, 60) || 'Someone',
-    canOwn: !!extra.canOwn,
-    createdAt: Date.now(),
-    active: true,
-  };
-  await env[KV_BINDING].put(`p:${person.id}`, JSON.stringify(person));
-  return person;
-}
+const publicPerson = p => ({ id: p.id, displayName: p.displayName, wrappedDataKey: p.wrappedDataKey, hasGoogle: (p.creds || []).some(c => c.startsWith('c:g:')) });
 
 async function addForecastToPerson(env, personId, fid) {
-  const key  = `pf:${personId}`;
+  const key = `pf:${personId}`;
   const list = (await env[KV_BINDING].get(key, { type: 'json' })) || [];
-  if (!list.includes(fid)) {
-    list.push(fid);
-    await env[KV_BINDING].put(key, JSON.stringify(list));
-  }
+  if (!list.includes(fid)) { list.push(fid); await env[KV_BINDING].put(key, JSON.stringify(list)); }
 }
 
-// ── Membership and the access predicate ────────────────────────────────────
+/**
+ * New person from a validated sign-up body. `loginSecret` is derived in the
+ * browser from the recovery key and is all the worker ever sees of it;
+ * it stores only the hash. `wrappedDataKey` is the person's data key,
+ * encrypted under a second key derived from the same recovery key, so a
+ * new device can recover it and the worker can never open it.
+ */
+async function createPerson(env, body, extraCred = null) {
+  const kv = env[KV_BINDING];
+  const nick = cleanNick(body.displayName);
+  if (!nick) return { error: 'Choose a nickname (no email addresses or links)' };
+  if (!isBlob(body.loginSecret, 64)) return { error: 'Missing login secret' };
+  if (!isBlob(body.wrappedDataKey)) return { error: 'Missing data key' };
+
+  const rkKey = `c:rk:${await sha256(body.loginSecret)}`;
+  if (await kv.get(rkKey)) return { error: 'Please try again' };   // astronomically unlikely
+  const person = { id: randomId(16), displayName: nick, wrappedDataKey: body.wrappedDataKey, creds: [rkKey], createdAt: Date.now() };
+  if (extraCred) person.creds.push(extraCred);
+  await kv.put(`p:${person.id}`, JSON.stringify(person));
+  await kv.put(rkKey, person.id);
+  if (extraCred) await kv.put(extraCred, person.id);
+  return { person };
+}
+
+// ── forecasts ──────────────────────────────────────────────────────────────
 
 async function getMembership(env, fid, personId) {
   const m = await env[KV_BINDING].get(`f:${fid}:m:${personId}`, { type: 'json' });
   return m && m.status === 'active' ? m : null;
 }
 
-async function requireAccess(request, env, fid, cors, needRole = null) {
-  const sess = await resolveSession(request, env);
-  if (!sess) return { ok: false, res: err('Sign in required', 401, cors) };
-  const m = await getMembership(env, fid, sess.personId);
-  if (!m) return { ok: false, res: err('No access to this forecast', 403, cors) };
-  if (needRole && m.role !== needRole) return { ok: false, res: err('Not permitted', 403, cors) };
-  return { ok: true, sess, role: m.role };
-}
-
-// ONE predicate decides what anyone may read. Default denies.
-// Shared entries go to both people; private entries go to their author only.
-function canReceive(personId, entry) {
-  if (entry.authorId === personId) return true;
-  return entry.visibility === 'shared';
-}
-
-// What the other person may learn about the forecast record itself.
-function metaFor(meta, role) {
-  if (role === 'owner') {
-    const { inviteToken, ...rest } = meta;
-    return { ...rest, hasPendingInvite: !!inviteToken };
-  }
-  // The subject never sees the owner's private label for her, or the
-  // relation category. She sees who is on the other end, and the cycle
-  // settings that drive her own predictions.
-  return {
-    id: meta.id, ownerName: meta.ownerName, subjectName: meta.subjectName,
-    cycleLength: meta.cycleLength, periodLength: meta.periodLength, createdAt: meta.createdAt,
-    // Whether to offer the desire reading on her check-in. Only partners.
-    asksDesire: meta.relation === 'partner',
+// What each person may learn about a forecast record.
+async function forecastFor(env, meta, role, personId) {
+  const wrappedKey = await env[KV_BINDING].get(`f:${meta.id}:k:${personId}`);
+  const base = {
+    id: meta.id, role, ownerName: meta.ownerName, subjectName: meta.subjectName,
+    kcv: meta.kcv, sharedEnc: meta.sharedEnc || null, wrappedKey, createdAt: meta.createdAt,
   };
+  if (role === 'owner') {
+    Object.assign(base, { subjectId: meta.subjectId, ownerEnc: meta.ownerEnc || null, hasPendingInvite: !!meta.inviteToken });
+  }
+  return base;
 }
 
-// ── Entry writes ───────────────────────────────────────────────────────────
+// ONE predicate for reads. Default denies.
+function canReceive(personId, entry) {
+  return entry.authorId === personId || entry.visibility === 'shared';
+}
+
+// ── entries ────────────────────────────────────────────────────────────────
 
 function validateEntry(e) {
   if (!e || typeof e !== 'object') return 'entry must be an object';
-  if (!isId(e.id, 8, 64)) return 'entry id must be a client-generated uuid';
-  if (!KINDS.includes(e.kind)) return 'invalid kind';
-  if (!isDate(e.date)) return 'date must be YYYY-MM-DD';
-  if (e.body != null && (typeof e.body !== 'string' || e.body.length > MAX_ENTRY_TEXT)) return 'body too long';
-  if (e.visibility != null && !VISIBILITIES.includes(e.visibility)) return 'invalid visibility';
-  if (e.fields != null) {
-    if (typeof e.fields !== 'object' || Array.isArray(e.fields)) return 'fields must be an object';
-    if (JSON.stringify(e.fields).length > MAX_FIELDS_JSON) return 'fields too large';
-  }
+  if (!isId(e.id, 8, 64)) return 'invalid id';
+  if (!['shared', 'private'].includes(e.visibility)) return 'invalid visibility';
   if (e.supersedes != null && !isId(e.supersedes, 8, 64)) return 'invalid supersedes';
+  if (e.deleted) return e.ct == null ? null : 'a deletion carries no content';
+  if (!isBlob(e.ct, MAX_CT)) return 'invalid ciphertext';
+  if (!['f', 'a'].includes(e.keyRef)) return 'invalid keyRef';
+  // Private content must be sealed with the author's own key, so the other
+  // member could not read it even with direct access to this database.
+  if (e.visibility === 'private' && e.keyRef !== 'a') return 'private entries use the author key';
   return null;
 }
 
@@ -275,81 +264,60 @@ async function handleWriteEntries(request, env, fid, cors, access) {
   if (!(await rateLimit(env, `w:${access.sess.sessionId}`, WRITE_RATE_LIMIT, WRITE_RATE_WIN))) {
     return err('Too many writes. Slow down.', 429, cors);
   }
-
-  const body = await readJson(request);
-  const list = body?.entries;
-  if (!Array.isArray(list) || !list.length) return err('entries[] required', 400, cors);
-  if (list.length > 50) return err('Too many entries in one batch (max 50)', 400, cors);
+  const list = (await readJson(request))?.entries;
+  if (!Array.isArray(list) || !list.length || list.length > 50) return err('entries[] (1 to 50) required', 400, cors);
 
   const tag = access.role === 'owner' ? 'o' : 's';
   const written = [], skipped = [];
-
   for (const raw of list) {
     const problem = validateEntry(raw);
-    if (problem) return err(`Entry ${raw?.id || '?'}: ${problem}`, 400, cors);
-
+    if (problem) return err(problem, 400, cors);
     const idxKey = `f:${fid}:eid:${raw.id}`;
     if (await kv.get(idxKey)) { skipped.push(raw.id); continue; }
 
-    // Period starts are cycle data, which both people need. Never private.
-    let visibility = raw.kind === 'period' ? 'shared' : (raw.visibility || 'shared');
-
-    // Editing or deleting: you may only supersede your own entry, and the
-    // replacement keeps the original's audience so a tombstone never
-    // tells someone about a note they were never shown.
+    let visibility = raw.visibility;
     if (raw.supersedes) {
       const prevKey = await kv.get(`f:${fid}:eid:${raw.supersedes}`);
-      const prev    = prevKey ? await kv.get(prevKey, { type: 'json' }) : null;
-      if (!prev) return err('Cannot edit an entry that does not exist', 404, cors);
+      const prev = prevKey ? await kv.get(prevKey, { type: 'json' }) : null;
+      if (!prev) return err('That entry does not exist', 404, cors);
       if (prev.authorId !== access.sess.personId) return err('You can only change your own entries', 403, cors);
+      // A tombstone keeps the original's audience, so it never reveals that
+      // a private entry existed.
       if (raw.deleted) visibility = prev.visibility;
+    } else if (raw.deleted) {
+      return err('A deletion must reference an entry', 400, cors);
     }
 
-    const cursor   = ts13();
-    const entryKey = `f:${fid}:e:${cursor}:${tag}:${raw.id}`;
+    const cursor = ts13();
     const entry = {
-      id:         raw.id,
-      authorId:   access.sess.personId,
-      authorName: access.sess.person.displayName,
-      authorRole: access.role,
-      kind:       raw.kind,
-      date:       raw.date,
-      createdAt:  Date.now(),
-      cursor,
-      body:       raw.body ?? null,
-      fields:     raw.fields ?? {},
-      visibility,
-      supersedes: raw.supersedes ?? null,
-      deleted:    raw.deleted ? 1 : 0,
+      id: raw.id, authorId: access.sess.personId, authorRole: access.role,
+      createdAt: Date.now(), cursor, visibility,
+      keyRef: raw.deleted ? null : raw.keyRef, ct: raw.deleted ? null : raw.ct,
+      supersedes: raw.supersedes || null, deleted: raw.deleted ? 1 : 0,
     };
-    await kv.put(entryKey, JSON.stringify(entry));
-    await kv.put(idxKey, entryKey);
+    const key = `f:${fid}:e:${cursor}:${tag}:${raw.id}`;
+    await kv.put(key, JSON.stringify(entry));
+    await kv.put(idxKey, key);
     written.push(entry);
   }
   if (written.length) await kv.put(`f:${fid}:last`, ts13());
   return ok({ written, skipped }, cors);
 }
 
-// GET /f/:fid/sync?since=<ts13>
-//
-// KV list() pages with an opaque cursor and cannot seek to a key, so this
-// walks key NAMES (cheap: one list op per 1,000 keys) and only reads the
-// values whose receipt time is at or after `since`. A single "last write"
-// marker lets an idle poll answer with one read and no listing at all.
+// Walks key NAMES with KV's cursor (list() cannot seek), and reads only the
+// values at or after `since`. Idle polls cost one read via f:<fid>:last.
 async function handleSync(request, env, fid, cors, access) {
-  const kv     = env[KV_BINDING];
-  const since  = new URL(request.url).searchParams.get('since') || '';
-  const valid  = /^\d{13}$/.test(since);
+  const kv = env[KV_BINDING];
+  const since = new URL(request.url).searchParams.get('since') || '';
+  const valid = /^\d{13}$/.test(since);
   if (valid) {
     const last = await kv.get(`f:${fid}:last`);
     if (last && last < since) return ok({ entries: [], cursor: since, more: false }, cors);
   }
-
-  const prefix = `f:${fid}:e:`;
   const entries = [];
-  let listCursor, cursor = since, more = false, reads = 0;
+  let lc, cursor = since, more = false, reads = 0;
   outer: do {
-    const page = await kv.list({ prefix, limit: 1000, ...(listCursor ? { cursor: listCursor } : {}) });
+    const page = await kv.list({ prefix: `f:${fid}:e:`, limit: 1000, ...(lc ? { cursor: lc } : {}) });
     for (const k of page.keys) {
       const ts = k.name.split(':')[3];
       if (valid && ts < since) continue;
@@ -359,21 +327,16 @@ async function handleSync(request, env, fid, cors, access) {
       if (v && canReceive(access.sess.personId, v)) entries.push(v);
       cursor = ts;
     }
-    listCursor = page.list_complete ? null : page.cursor;
-  } while (listCursor);
-
+    lc = page.list_complete ? null : page.cursor;
+  } while (lc);
   return ok({ entries, cursor, more }, cors);
 }
 
-// Delete every entry one role wrote ('o' or 's'), or all of them (null).
-// Paged with KV's own cursor, because list() is eventually consistent and
-// may keep showing keys that were just deleted; re-listing from the start
-// could spin on the same page. The client passes `cursor` back while more.
-async function purgeByTag(env, fid, tag, listCursor) {
+async function purgeByTag(env, fid, tag, lc) {
   const kv = env[KV_BINDING];
-  const page = await kv.list({ prefix: `f:${fid}:e:`, limit: 300, ...(listCursor ? { cursor: listCursor } : {}) });
+  const page = await kv.list({ prefix: `f:${fid}:e:`, limit: 300, ...(lc ? { cursor: lc } : {}) });
   for (const k of page.keys) {
-    const parts = k.name.split(':');              // f fid e ts tag uuid
+    const parts = k.name.split(':');
     if (tag && parts[4] !== tag) continue;
     await kv.delete(k.name);
     await kv.delete(`f:${fid}:eid:${parts[5]}`);
@@ -382,128 +345,168 @@ async function purgeByTag(env, fid, tag, listCursor) {
   return page.list_complete ? { more: false } : { more: true, cursor: page.cursor };
 }
 
-// ── Auth routes ────────────────────────────────────────────────────────────
+// Ends a subject's membership. Deliberately silent: nothing is sent to the
+// owner, and the owner's view simply returns to the invite state.
+async function endSubject(env, fid, meta, personId, status) {
+  const kv = env[KV_BINDING];
+  await kv.put(`f:${fid}:m:${personId}`, JSON.stringify({ personId, forecastId: fid, role: 'subject', status, endedAt: Date.now() }));
+  await kv.delete(`f:${fid}:k:${personId}`);
+  meta.subjectId = null; meta.subjectName = null;
+  await kv.put(`f:${fid}:meta`, JSON.stringify(meta));
+}
 
-async function handleAuth(url, method, request, env, cors, ip) {
-  const kv   = env[KV_BINDING];
+async function deleteForecastRecords(env, fid, meta) {
+  const kv = env[KV_BINDING];
+  for (const pid of [meta.ownerId, meta.subjectId].filter(Boolean)) {
+    await kv.delete(`f:${fid}:m:${pid}`);
+    await kv.delete(`f:${fid}:k:${pid}`);
+  }
+  if (meta.inviteToken) await kv.delete(`i:${meta.inviteToken}`);
+  await kv.delete(`f:${fid}:meta`);
+  await kv.delete(`f:${fid}:last`);
+}
+
+// ── auth routes ────────────────────────────────────────────────────────────
+
+async function handleAuth(url, method, request, env, cors, ipHash) {
+  const kv = env[KV_BINDING];
   const path = url.pathname;
 
   if (path === '/auth/config' && method === 'GET') {
     const gid = (env.GOOGLE_CLIENT_ID || '').trim();
-    return ok({ googleClientId: gid, googleEnabled: !!gid }, cors);
+    return ok({
+      googleEnabled: !!gid, googleClientId: gid,
+      turnstileSiteKey: env.TURNSTILE_SECRET ? (env.TURNSTILE_SITE_KEY || '').trim() : '',
+    }, cors);
   }
 
-  if (!(await rateLimit(env, `ip:${ip}`, AUTH_RATE_LIMIT, AUTH_RATE_WIN))) {
-    return err('Too many attempts. Try again in a few minutes.', 429, cors,
-      { 'Retry-After': String(AUTH_RATE_WIN) });
+  if (!(await rateLimit(env, `ip:${ipHash}`, AUTH_RATE_LIMIT, AUTH_RATE_WIN))) {
+    return err('Too many attempts. Try again in a few minutes.', 429, cors, { 'Retry-After': String(AUTH_RATE_WIN) });
   }
 
-  // POST /auth/signup — create an account that can own forecasts
+  // POST /auth/signup { displayName, loginSecret, wrappedDataKey, adult, turnstileToken, idToken? }
   if (path === '/auth/signup' && method === 'POST') {
-    if (!env.SIGNUP_TOKEN) return err('Sign-up is not configured', 403, cors);
     const body = await readJson(request);
-    if (!body?.displayName) return err('displayName required', 400, cors);
-    if (!safeEqual(String(body.signupToken || ''), env.SIGNUP_TOKEN)) {
-      return err('That sign-up code is not right', 403, cors);
+    if (!body) return err('Invalid body', 400, cors);
+    if (body.adult !== true) return err('You must be 18 or older to use Forecast', 400, cors);
+    if (!(await turnstileOk(env, body.turnstileToken, ipHash))) return err('Verification failed. Try again.', 403, cors);
+    if (!(await rateLimit(env, `su:${ipHash}`, SIGNUP_IP_LIMIT, 3600))) return err('Too many new accounts from this network. Try later.', 429, cors);
+
+    let gCred = null;
+    if (body.idToken) {
+      const sub = await verifyGoogleSub(body.idToken, (env.GOOGLE_CLIENT_ID || '').trim());
+      if (!sub) return err('Google sign-in expired. Try again.', 401, cors);
+      gCred = `c:g:${await hmac(env, 'google:' + sub)}`;
+      if (await kv.get(gCred)) return err('That Google account already has a Forecast account', 409, cors);
     }
-    const person = await createPerson(env, body.displayName, { canOwn: true });
-    const sid = await createSession(env, person.id, request);
-    return ok({ sessionId: sid, person }, cors);
+    const r = await createPerson(env, body, gCred);
+    if (r.error) return err(r.error, 400, cors);
+    return ok({ sessionId: await createSession(env, r.person.id), person: publicPerson(r.person) }, cors);
   }
 
-  // GET /auth/invite/<token> — who is inviting me? Shown before accepting.
-  if (path.startsWith('/auth/invite/') && method === 'GET') {
-    const token  = path.slice('/auth/invite/'.length);
-    if (!isId(token, 16, 128)) return err('Invalid invite', 400, cors);
-    const invite = await kv.get(`i:${token}`, { type: 'json' });
-    if (!invite || invite.redeemedAt) return err('This invite has expired or was already used', 404, cors);
-    return ok({ ownerName: invite.ownerName, expiresAt: invite.expiresAt }, cors);
-  }
-
-  // POST /auth/invite/redeem — accept. Works signed out (creates a person)
-  // or signed in (attaches this forecast to the existing person, so one
-  // woman invited by two people still has one account).
-  if (path === '/auth/invite/redeem' && method === 'POST') {
+  // POST /auth/recover { loginSecret } — sign in with a recovery key
+  if (path === '/auth/recover' && method === 'POST') {
     const body = await readJson(request);
-    if (!isId(body?.inviteToken, 16, 128)) return err('Invalid invite', 400, cors);
-    if (body.periodStart != null && !isDate(body.periodStart)) return err('periodStart must be YYYY-MM-DD', 400, cors);
-
-    const invite = await kv.get(`i:${body.inviteToken}`, { type: 'json' });
-    if (!invite || invite.redeemedAt) return err('This invite has expired or was already used', 404, cors);
-
-    const meta = await kv.get(`f:${invite.forecastId}:meta`, { type: 'json' });
-    if (!meta || meta.inviteToken !== body.inviteToken) return err('This invite is no longer valid', 410, cors);
-    if (meta.subjectId) return err('Someone has already accepted this invite', 409, cors);
-
-    let sess = await resolveSession(request, env);
-    let person;
-    if (sess) {
-      if (sess.personId === meta.ownerId) return err('You cannot accept your own invite', 400, cors);
-      person = sess.person;
-    } else {
-      if (!body.displayName) return err('displayName required', 400, cors);
-      person = await createPerson(env, body.displayName);
-    }
-
-    const now = Date.now();
-    await kv.put(`f:${meta.id}:m:${person.id}`, JSON.stringify({
-      personId: person.id, forecastId: meta.id, role: 'subject', status: 'active', createdAt: now,
-    }));
-    await addForecastToPerson(env, person.id, meta.id);
-
-    meta.subjectId   = person.id;
-    meta.subjectName = person.displayName;
-    meta.acceptedAt  = now;
-    delete meta.inviteToken;
-    await kv.put(`f:${meta.id}:meta`, JSON.stringify(meta));
-    await kv.put(`i:${body.inviteToken}`, JSON.stringify({ ...invite, redeemedAt: now }),
-      { expirationTtl: 60 * 60 * 24 * 7 });
-
-    if (body.periodStart) {
-      const eid = randomId(12);
-      const cursor = ts13();
-      const key = `f:${meta.id}:e:${cursor}:s:${eid}`;
-      await kv.put(key, JSON.stringify({
-        id: eid, authorId: person.id, authorName: person.displayName, authorRole: 'subject',
-        kind: 'period', date: body.periodStart, createdAt: now, cursor,
-        body: null, fields: {}, visibility: 'shared', supersedes: null, deleted: 0,
-      }));
-      await kv.put(`f:${meta.id}:eid:${eid}`, key);
-    }
-
-    const sid = sess ? sess.sessionId : await createSession(env, person.id, request);
-    return ok({ sessionId: sid, person, forecastId: meta.id }, cors);
+    if (!isBlob(body?.loginSecret, 64)) return err('Invalid recovery key', 400, cors);
+    const pid = await kv.get(`c:rk:${await sha256(body.loginSecret)}`);
+    const person = pid && await kv.get(`p:${pid}`, { type: 'json' });
+    if (!person) return err('That recovery key doesn\u2019t match an account', 404, cors);
+    return ok({ sessionId: await createSession(env, pid), person: publicPerson(person) }, cors);
   }
 
   if (path === '/auth/google' && method === 'POST') {
     const body = await readJson(request);
-    const p = await verifyGoogleJWT(body?.idToken, (env.GOOGLE_CLIENT_ID || '').trim());
-    if (!p) return err('Invalid or expired Google token', 401, cors);
-    const personId = await kv.get(`c:google:${p.sub}`);
-    if (!personId) return err('No account is linked to that Google login yet.', 404, cors);
-    const person = await kv.get(`p:${personId}`, { type: 'json' });
-    if (!person || person.active === false) return err('Account is inactive', 403, cors);
-    return ok({ sessionId: await createSession(env, personId, request), person }, cors);
+    const sub = await verifyGoogleSub(body?.idToken, (env.GOOGLE_CLIENT_ID || '').trim());
+    if (!sub) return err('Invalid or expired Google sign-in', 401, cors);
+    const pid = await kv.get(`c:g:${await hmac(env, 'google:' + sub)}`);
+    const person = pid && await kv.get(`p:${pid}`, { type: 'json' });
+    if (!person) return err('No Forecast account uses that Google login yet', 404, cors);
+    return ok({ sessionId: await createSession(env, pid), person: publicPerson(person) }, cors);
   }
 
   if (path === '/auth/google/link' && method === 'POST') {
     const sess = await resolveSession(request, env);
     if (!sess) return err('Sign in required', 401, cors);
     const body = await readJson(request);
-    const p = await verifyGoogleJWT(body?.idToken, (env.GOOGLE_CLIENT_ID || '').trim());
-    if (!p) return err('Invalid or expired Google token', 401, cors);
-    const existing = await kv.get(`c:google:${p.sub}`);
-    if (existing && existing !== sess.personId) return err('That Google account is linked to someone else', 409, cors);
-    await kv.put(`c:google:${p.sub}`, sess.personId);
-    const person = { ...sess.person, googleSub: p.sub, email: p.email || sess.person.email || null };
-    await kv.put(`p:${sess.personId}`, JSON.stringify(person));
-    return ok({ ok: true, person }, cors);
+    const sub = await verifyGoogleSub(body?.idToken, (env.GOOGLE_CLIENT_ID || '').trim());
+    if (!sub) return err('Invalid or expired Google sign-in', 401, cors);
+    const cred = `c:g:${await hmac(env, 'google:' + sub)}`;
+    const existing = await kv.get(cred);
+    if (existing && existing !== sess.personId) return err('That Google account belongs to another Forecast account', 409, cors);
+    await kv.put(cred, sess.personId);
+    const p = sess.person;
+    p.creds = [...new Set([...(p.creds || []), cred])];
+    await kv.put(`p:${p.id}`, JSON.stringify(p));
+    return ok({ person: publicPerson(p) }, cors);
+  }
+
+  // POST /auth/rekey { loginSecret, wrappedDataKey } — new recovery key.
+  // The old recovery key stops working immediately. The data key inside is
+  // usually the same one rewrapped; after a lost key it is a fresh one.
+  if (path === '/auth/rekey' && method === 'POST') {
+    const sess = await resolveSession(request, env);
+    if (!sess) return err('Sign in required', 401, cors);
+    const body = await readJson(request);
+    if (!isBlob(body?.loginSecret, 64) || !isBlob(body?.wrappedDataKey)) return err('Invalid body', 400, cors);
+    const p = sess.person;
+    for (const c of (p.creds || []).filter(c => c.startsWith('c:rk:'))) await kv.delete(c);
+    const rk = `c:rk:${await sha256(body.loginSecret)}`;
+    await kv.put(rk, p.id);
+    p.creds = [...(p.creds || []).filter(c => !c.startsWith('c:rk:')), rk];
+    p.wrappedDataKey = body.wrappedDataKey;
+    await kv.put(`p:${p.id}`, JSON.stringify(p));
+    return ok({ person: publicPerson(p) }, cors);
+  }
+
+  if (path.startsWith('/auth/invite/') && method === 'GET') {
+    const token = path.slice('/auth/invite/'.length);
+    if (!isId(token, 16, 128)) return err('Invalid invite', 400, cors);
+    const inv = await kv.get(`i:${token}`, { type: 'json' });
+    if (!inv || inv.redeemedAt) return err('This invite has expired or was already used', 404, cors);
+    const meta = await kv.get(`f:${inv.forecastId}:meta`, { type: 'json' });
+    if (!meta || meta.inviteToken !== token) return err('This invite is no longer valid', 410, cors);
+    return ok({ ownerName: meta.ownerName, forecastId: meta.id, kcv: meta.kcv, sharedEnc: meta.sharedEnc, expiresAt: inv.expiresAt }, cors);
+  }
+
+  // POST /auth/invite/redeem { inviteToken, adult, wrappedKey, signup? }
+  // Signed out: `signup` carries the same fields as /auth/signup.
+  // Signed in: attaches to the existing account.
+  if (path === '/auth/invite/redeem' && method === 'POST') {
+    const body = await readJson(request);
+    if (!isId(body?.inviteToken, 16, 128)) return err('Invalid invite', 400, cors);
+    if (body.adult !== true) return err('You must be 18 or older to use Forecast', 400, cors);
+    const inv = await kv.get(`i:${body.inviteToken}`, { type: 'json' });
+    if (!inv || inv.redeemedAt) return err('This invite has expired or was already used', 404, cors);
+    const meta = await kv.get(`f:${inv.forecastId}:meta`, { type: 'json' });
+    if (!meta || meta.inviteToken !== body.inviteToken) return err('This invite is no longer valid', 410, cors);
+    if (meta.subjectId) return err('Someone has already accepted this invite', 409, cors);
+
+    let sess = await resolveSession(request, env), person;
+    if (sess) {
+      if (sess.personId === meta.ownerId) return err('You can\u2019t accept your own invite', 400, cors);
+      person = sess.person;
+    } else {
+      const r = await createPerson(env, { ...(body.signup || {}) });
+      if (r.error) return err(r.error, 400, cors);
+      person = r.person;
+    }
+
+    const now = Date.now();
+    await kv.put(`f:${meta.id}:m:${person.id}`, JSON.stringify({ personId: person.id, forecastId: meta.id, role: 'subject', status: 'active', createdAt: now }));
+    if (isBlob(body.wrappedKey)) await kv.put(`f:${meta.id}:k:${person.id}`, body.wrappedKey);
+    await addForecastToPerson(env, person.id, meta.id);
+    meta.subjectId = person.id; meta.subjectName = person.displayName; meta.acceptedAt = now;
+    delete meta.inviteToken;
+    await kv.put(`f:${meta.id}:meta`, JSON.stringify(meta));
+    await kv.delete(`i:${body.inviteToken}`);
+
+    const sid = sess ? sess.sessionId : await createSession(env, person.id);
+    return ok({ sessionId: sid, person: publicPerson(person), forecastId: meta.id }, cors);
   }
 
   if (path === '/auth/signout' && method === 'POST') {
-    const hdr = request.headers.get('Authorization') || '';
-    const sid = hdr.startsWith('Bearer ') ? hdr.slice(7).trim() : '';
-    if (isId(sid, 16, 128)) await kv.delete(`s:${sid}`);
+    const sid = bearer(request);
+    if (sid) await kv.delete(`s:${sid}`);
     return ok({ ok: true }, cors);
   }
 
@@ -516,114 +519,138 @@ async function handleAuth(url, method, request, env, cors, ip) {
       const m = await getMembership(env, fid, sess.personId);
       if (!m) continue;
       const meta = await kv.get(`f:${fid}:meta`, { type: 'json' });
-      if (meta) forecasts.push({ ...metaFor(meta, m.role), role: m.role });
+      if (meta) forecasts.push(await forecastFor(env, meta, m.role, sess.personId));
     }
-    const { googleSub, ...person } = sess.person;
-    return ok({ person, forecasts, hasGoogle: !!googleSub }, cors);
+    return ok({ person: publicPerson(sess.person), forecasts }, cors);
+  }
+
+  // POST /auth/delete — final step of account deletion. The client first
+  // deletes every forecast it owns and leaves every one it was invited to
+  // (both paged); this refuses until that is done, then removes the person,
+  // every credential, and this session.
+  if (path === '/auth/delete' && method === 'POST') {
+    const sess = await resolveSession(request, env);
+    if (!sess) return err('Sign in required', 401, cors);
+    const fids = (await kv.get(`pf:${sess.personId}`, { type: 'json' })) || [];
+    for (const fid of fids) {
+      if (await getMembership(env, fid, sess.personId)) return err('Delete or leave every forecast first', 409, cors);
+    }
+    for (const c of sess.person.creds || []) await kv.delete(c);
+    await kv.delete(`pf:${sess.personId}`);
+    await kv.delete(`p:${sess.personId}`);
+    await kv.delete(`s:${sess.sessionId}`);
+    return ok({ ok: true }, cors);
   }
 
   return null;
 }
 
-// ── Router ─────────────────────────────────────────────────────────────────
+// ── router ─────────────────────────────────────────────────────────────────
 
 async function readJson(request) {
   try {
-    const text = await request.text();
-    if (text.length > MAX_BODY) return null;
-    return JSON.parse(text);
+    const t = await request.text();
+    return t.length > MAX_BODY ? null : JSON.parse(t);
   } catch { return null; }
 }
 
 export default {
   async fetch(request, env) {
-    const url    = new URL(request.url);
+    const url = new URL(request.url);
     const method = request.method;
-    const cors   = buildCors(getAllowedOrigin(request, env));
-    const ip     = request.headers.get('CF-Connecting-IP') || 'unknown';
+    const cors = buildCors(getAllowedOrigin(request, env));
 
     if (method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
     if (method === 'GET' && (url.pathname === '/' || url.pathname === '/ping')) {
-      return ok({ ok: true, service: 'forecast', time: Date.now() }, cors);
+      return ok({ ok: true, service: 'forecast', e2e: true, time: Date.now() }, cors);
     }
     if (!env[KV_BINDING]) return err('KV namespace not bound', 500, cors);
+    if (!env.ID_PEPPER || env.ID_PEPPER.length < 16) return err('ID_PEPPER secret not set', 500, cors);
     const kv = env[KV_BINDING];
+
+    // Short keyed hash, used only inside expiring rate-limit counters.
+    const ipHash = (await hmac(env, 'ip:' + (request.headers.get('CF-Connecting-IP') || 'unknown'))).slice(0, 16);
 
     try {
       if (url.pathname.startsWith('/auth/')) {
-        return (await handleAuth(url, method, request, env, cors, ip)) || err('Not found', 404, cors);
+        return (await handleAuth(url, method, request, env, cors, ipHash)) || err('Not found', 404, cors);
       }
 
-      // POST /forecasts — create a new forecast (one per person you invite)
+      // POST /forecasts { id, kcv, wrappedKey, sharedEnc, ownerEnc }
+      // The browser chooses the id so it can bind ciphertext to it before
+      // the forecast exists here.
       if (url.pathname === '/forecasts' && method === 'POST') {
         const sess = await resolveSession(request, env);
         if (!sess) return err('Sign in required', 401, cors);
-        if (!sess.person.canOwn) return err('This account can only receive invites', 403, cors);
         const body = await readJson(request);
-        const label = String(body?.label || '').trim().slice(0, 40);
-        if (!label) return err('label required', 400, cors);
-        const fid = randomId(12);
-        const now = Date.now();
+        if (!isId(body?.id, 16, 32)) return err('Invalid id', 400, cors);
+        for (const f of ['kcv', 'wrappedKey', 'sharedEnc', 'ownerEnc']) if (!isBlob(body[f])) return err(`Invalid ${f}`, 400, cors);
+        if (await kv.get(`f:${body.id}:meta`)) return err('Try again', 409, cors);
+
+        const fids = (await kv.get(`pf:${sess.personId}`, { type: 'json' })) || [];
+        let owned = 0;
+        for (const fid of fids) if ((await getMembership(env, fid, sess.personId))?.role === 'owner') owned++;
+        if (owned >= MAX_FORECASTS) return err(`You can have up to ${MAX_FORECASTS} forecasts`, 403, cors);
+
         const meta = {
-          id: fid, label,
-          relation: RELATIONS.includes(body.relation) ? body.relation : 'partner',
-          ownerId: sess.personId, ownerName: sess.person.displayName,
+          id: body.id, ownerId: sess.personId, ownerName: sess.person.displayName,
           subjectId: null, subjectName: null,
-          cycleLength: 28, periodLength: 5, createdAt: now,
+          kcv: body.kcv, sharedEnc: body.sharedEnc, ownerEnc: body.ownerEnc, createdAt: Date.now(),
         };
-        await kv.put(`f:${fid}:meta`, JSON.stringify(meta));
-        await kv.put(`f:${fid}:m:${sess.personId}`, JSON.stringify({
-          personId: sess.personId, forecastId: fid, role: 'owner', status: 'active', createdAt: now,
-        }));
-        await addForecastToPerson(env, sess.personId, fid);
-        return ok({ forecast: { ...metaFor(meta, 'owner'), role: 'owner' } }, cors);
+        await kv.put(`f:${meta.id}:meta`, JSON.stringify(meta));
+        await kv.put(`f:${meta.id}:m:${sess.personId}`, JSON.stringify({ personId: sess.personId, forecastId: meta.id, role: 'owner', status: 'active', createdAt: meta.createdAt }));
+        await kv.put(`f:${meta.id}:k:${sess.personId}`, body.wrappedKey);
+        await addForecastToPerson(env, sess.personId, meta.id);
+        return ok({ forecast: await forecastFor(env, meta, 'owner', sess.personId) }, cors);
       }
 
       if (!url.pathname.startsWith('/f/')) return err('Not found', 404, cors);
-
       const [, fid, ...tail] = url.pathname.split('/').filter(Boolean);
       if (!isId(fid, 8, 64)) return err('Invalid forecast id', 400, cors);
 
-      const access = await requireAccess(request, env, fid, cors);
-      if (!access.ok) return access.res;
+      const sess = await resolveSession(request, env);
+      if (!sess) return err('Sign in required', 401, cors);
+      const m = await getMembership(env, fid, sess.personId);
+      if (!m) return err('No access to this forecast', 403, cors);
       const meta = await kv.get(`f:${fid}:meta`, { type: 'json' });
       if (!meta) return err('Not found', 404, cors);
-      const isOwner = access.role === 'owner';
+      const access = { sess, role: m.role };
+      const isOwner = m.role === 'owner';
       const op = tail.join('/');
 
-      if (op === '' && method === 'GET') return ok({ forecast: { ...metaFor(meta, access.role), role: access.role } }, cors);
       if (op === 'entries' && method === 'POST') return await handleWriteEntries(request, env, fid, cors, access);
       if (op === 'sync' && method === 'GET') return await handleSync(request, env, fid, cors, access);
 
-      // PUT /f/:fid/settings — owner renames the tab; either person can set
-      // cycle and period length, since she knows her own body best.
-      if (op === 'settings' && method === 'PUT') {
-        const body = await readJson(request) || {};
-        if (isOwner && body.label) meta.label = String(body.label).trim().slice(0, 40) || meta.label;
-        if (isOwner && RELATIONS.includes(body.relation)) meta.relation = body.relation;
-        const cl = parseInt(body.cycleLength, 10), pl = parseInt(body.periodLength, 10);
-        if (cl >= 18 && cl <= 60) meta.cycleLength = cl;
-        if (pl >= 1 && pl <= 12)  meta.periodLength = pl;
-        meta.updatedAt = Date.now();
-        await kv.put(`f:${fid}:meta`, JSON.stringify(meta));
-        return ok({ forecast: { ...metaFor(meta, access.role), role: access.role } }, cors);
+      // Your own wrapped copy of the forecast key (after a recovery-key reset
+      // or opening a key link on a new device).
+      if (op === 'key' && method === 'PUT') {
+        const body = await readJson(request);
+        if (!isBlob(body?.wrappedKey)) return err('Invalid key', 400, cors);
+        await kv.put(`f:${fid}:k:${sess.personId}`, body.wrappedKey);
+        return ok({ ok: true }, cors);
       }
 
-      // POST /f/:fid/invite — owner, only while nobody has accepted.
-      // Making a new link kills the old one.
+      // Opaque settings blobs. Either member may update the shared one
+      // (cycle length is hers to correct); only the owner has an owner blob.
+      if (op === 'settings' && method === 'PUT') {
+        const body = await readJson(request) || {};
+        if (body.sharedEnc != null) { if (!isBlob(body.sharedEnc)) return err('Invalid sharedEnc', 400, cors); meta.sharedEnc = body.sharedEnc; }
+        if (body.ownerEnc != null) { if (!isOwner || !isBlob(body.ownerEnc)) return err('Not permitted', 403, cors); meta.ownerEnc = body.ownerEnc; }
+        await kv.put(`f:${fid}:meta`, JSON.stringify(meta));
+        return ok({ forecast: await forecastFor(env, meta, m.role, sess.personId) }, cors);
+      }
+
       if (op === 'invite' && method === 'POST') {
         if (!isOwner) return err('Not permitted', 403, cors);
         if (meta.subjectId) return err('Someone has already joined this forecast', 409, cors);
+        if (!(await rateLimit(env, `inv:${sess.personId}`, INVITE_DAY_LIMIT, 86400))) return err('Invite limit reached for today', 429, cors);
         if (meta.inviteToken) await kv.delete(`i:${meta.inviteToken}`);
         const token = randomId(24);
-        const invite = {
-          token, forecastId: fid, ownerName: meta.ownerName,
-          createdAt: Date.now(), expiresAt: Date.now() + INVITE_TTL * 1000,
-        };
-        await kv.put(`i:${token}`, JSON.stringify(invite), { expirationTtl: INVITE_TTL });
+        const inv = { forecastId: fid, createdAt: Date.now(), expiresAt: Date.now() + INVITE_TTL * 1000 };
+        await kv.put(`i:${token}`, JSON.stringify(inv), { expirationTtl: INVITE_TTL });
         meta.inviteToken = token;
         await kv.put(`f:${fid}:meta`, JSON.stringify(meta));
-        return ok({ token, expiresAt: invite.expiresAt }, cors);
+        return ok({ token, expiresAt: inv.expiresAt }, cors);
       }
 
       if (op === 'invite/cancel' && method === 'POST') {
@@ -634,53 +661,35 @@ export default {
         return ok({ ok: true }, cors);
       }
 
-      // POST /f/:fid/remove — owner ends sharing with her.
       if (op === 'remove' && method === 'POST') {
         if (!isOwner) return err('Not permitted', 403, cors);
-        if (meta.subjectId) {
-          await kv.put(`f:${fid}:m:${meta.subjectId}`, JSON.stringify({
-            personId: meta.subjectId, forecastId: fid, role: 'subject', status: 'removed', endedAt: Date.now(),
-          }));
-        }
-        meta.subjectId = null; meta.subjectName = null;
-        await kv.put(`f:${fid}:meta`, JSON.stringify(meta));
+        if (meta.subjectId) await endSubject(env, fid, meta, meta.subjectId, 'removed');
         return ok({ ok: true }, cors);
       }
 
-      // POST /f/:fid/leave  { erase: bool } — she stops sharing. With erase,
-      // everything she wrote is deleted first; call repeatedly while more.
       if (op === 'leave' && method === 'POST') {
         if (isOwner) return err('Owners delete the forecast instead', 400, cors);
         const body = await readJson(request) || {};
         if (body.erase) {
           const r = await purgeByTag(env, fid, 's', body.cursor);
-          if (r.more) return ok({ ok: true, more: true, cursor: r.cursor }, cors);
+          if (r.more) return ok({ more: true, cursor: r.cursor }, cors);
         }
-        await kv.put(`f:${fid}:m:${access.sess.personId}`, JSON.stringify({
-          personId: access.sess.personId, forecastId: fid, role: 'subject', status: 'left', endedAt: Date.now(),
-        }));
-        meta.subjectId = null; meta.subjectName = null;
-        await kv.put(`f:${fid}:meta`, JSON.stringify(meta));
-        return ok({ ok: true, more: false }, cors);
+        await endSubject(env, fid, meta, sess.personId, 'left');
+        return ok({ more: false }, cors);
       }
 
-      // POST /f/:fid/delete — owner deletes the whole forecast. Paged.
       if (op === 'delete' && method === 'POST') {
         if (!isOwner) return err('Not permitted', 403, cors);
         const body = await readJson(request) || {};
         const r = await purgeByTag(env, fid, null, body.cursor);
-        if (r.more) return ok({ ok: true, more: true, cursor: r.cursor }, cors);
-        if (meta.subjectId) await kv.delete(`f:${fid}:m:${meta.subjectId}`);
-        if (meta.inviteToken) await kv.delete(`i:${meta.inviteToken}`);
-        await kv.delete(`f:${fid}:m:${meta.ownerId}`);
-        await kv.delete(`f:${fid}:meta`);
-        await kv.delete(`f:${fid}:last`);
-        return ok({ ok: true, more: false }, cors);
+        if (r.more) return ok({ more: true, cursor: r.cursor }, cors);
+        await deleteForecastRecords(env, fid, meta);
+        return ok({ more: false }, cors);
       }
 
       return err('Not found', 404, cors);
     } catch (e) {
-      console.error('[worker]', e);
+      console.error('[worker]', e?.message);
       return err('Server error', 500, cors);
     }
   },
