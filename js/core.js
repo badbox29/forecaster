@@ -4,10 +4,10 @@
  */
 
 // ── Local settings ─────────────────────────────────────────────────────────
-// The worker address is entered in the app (first run, or Settings → Sync
-// address) and kept here, so nothing about your deployment lives in the
-// repo. Only the worker address, the session token and the selected tab
-// live on the device. Entries are fetched fresh, so a deletion on one side can
+// The worker address is entered on first run and kept here, so nothing
+// about your deployment lives in the repo. localStorage holds only the
+// worker address, the session token and the selected tab. The data key
+// lives in IndexedDB (see vault.js). Entries are fetched fresh, so a deletion on one side can
 // never linger in a cache on the other.
 const Local = {
   get: k => { try { return localStorage.getItem('fc.' + k) || ''; } catch { return ''; } },
@@ -57,14 +57,18 @@ const Api = (() => {
     setSession: s => { session = s || ''; },
     config:       () => call('/auth/config'),
     me:           () => call('/auth/me'),
-    signup:       (displayName, signupToken) => post('/auth/signup', { displayName, signupToken }),
+    signup:       (b) => post('/auth/signup', b),
+    recover:      (loginSecret) => post('/auth/recover', { loginSecret }),
+    rekey:        (b) => post('/auth/rekey', b),
     invitePreview:(t) => call(`/auth/invite/${encodeURIComponent(t)}`),
     redeem:       (b) => post('/auth/invite/redeem', b),
     google:       (idToken) => post('/auth/google', { idToken }),
     googleLink:   (idToken) => post('/auth/google/link', { idToken }),
     signOut:      () => post('/auth/signout'),
-    createForecast: (label, relation) => post('/forecasts', { label, relation }),
+    deleteAccount:() => post('/auth/delete'),
+    createForecast: (b) => post('/forecasts', b),
     settings:     (fid, b) => call(`/f/${fid}/settings`, { method: 'PUT', body: b }),
+    putKey:       (fid, wrappedKey) => call(`/f/${fid}/key`, { method: 'PUT', body: { wrappedKey } }),
     write:        (fid, entries) => post(`/f/${fid}/entries`, { entries }),
     sync:         (fid, since) => call(`/f/${fid}/sync?since=${since || ''}`),
     invite:       (fid) => post(`/f/${fid}/invite`),
@@ -103,7 +107,7 @@ function resolveEntries(raw) {
   const replaced = new Set(raw.filter(e => e.supersedes).map(e => e.supersedes));
   return [...byId.values()]
     .filter(e => !replaced.has(e.id) && !e.deleted)
-    .sort((a, b) => (b.date.localeCompare(a.date)) || (b.createdAt - a.createdAt));
+    .sort((a, b) => ((b.date || '').localeCompare(a.date || '')) || (b.createdAt - a.createdAt));
 }
 
 // ── Cycle ──────────────────────────────────────────────────────────────────

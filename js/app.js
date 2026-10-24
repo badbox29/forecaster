@@ -4,6 +4,9 @@
  * Every piece of user text reaches the page through textContent, never
  * innerHTML. The only innerHTML in this file is static icon markup and
  * SVG built from numbers.
+ *
+ * Nothing readable leaves this browser. Entries, settings and tab names
+ * are sealed with vault.js before any request; the worker only routes.
  */
 (() => {
   const $ = id => document.getElementById(id);
@@ -39,61 +42,118 @@
 
   // ── state ────────────────────────────────────────────────────────────
   const S = {
-    me: null,
-    forecasts: [],
+    me: null,           // { id, displayName, wrappedDataKey, hasGoogle }
+    dataKey: null,      // this person's data key (CryptoKey)
+    forecasts: [],      // decorated: key, label, relation, cycleLength, ...
     active: null,
-    raw: {},          // fid → Map(id → entry) as the server sent them
-    cursor: {},       // fid → ts13
+    raw: {},            // fid → Map(id → entry as the server sent it)
+    cursor: {},
     gConfig: null,
   };
   const activeForecast = () => S.forecasts.find(f => f.id === S.active);
-  const entriesFor = fid => resolveEntries([...(S.raw[fid]?.values() || [])]);
 
-  // ── toast ────────────────────────────────────────────────────────────
   let toastTimer;
   function toast(msg) {
     const t = $('toast');
     t.textContent = msg; t.hidden = false;
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { t.hidden = true; }, 3200);
+    toastTimer = setTimeout(() => { t.hidden = true; }, 3400);
   }
-
-  function uid() {
-    const b = crypto.getRandomValues(new Uint8Array(12));
+  function uid(n = 12) {
+    const b = crypto.getRandomValues(new Uint8Array(n));
     return btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   }
-
   async function busy(btn, fn) {
     btn.disabled = true;
     try { return await fn(); }
-    catch (e) { toast(e.message || 'Something went wrong'); }
+    catch (e) { console.error(e); toast(e.message || 'Something went wrong'); }
     finally { btn.disabled = false; }
   }
+  const check = (label) => {
+    const box = h('input', { type: 'checkbox' });
+    const row = h('label', { class: 'row small check' }, box, h('span', { text: label }));
+    row.checked = () => box.checked;
+    return row;
+  };
+  const cleanUrl = () => history.replaceState(null, '', location.pathname);
+
+  // ── decrypting what the worker sends ─────────────────────────────────
+  const DEFAULT_SHARED = { cycleLength: 28, periodLength: 5, asksDesire: false };
+
+  async function decorate(f) {
+    const k = S.dataKey && f.wrappedKey ? await Vault.unwrapForecast(S.dataKey, f.wrappedKey, f.id, f.kcv) : null;
+    let shared = { ...DEFAULT_SHARED };
+    if (k && f.sharedEnc) { try { shared = { ...shared, ...await Vault.open(k.key, f.sharedEnc, `shared:${f.id}`) }; } catch {} }
+    let own = { label: 'Forecast', relation: 'partner' };
+    if (f.role === 'owner' && f.ownerEnc) { try { own = { ...own, ...await Vault.open(S.dataKey, f.ownerEnc, `owner:${f.id}`) }; } catch {} }
+    return Object.assign(f, { key: k, locked: !k, ...shared, ...(f.role === 'owner' ? own : {}) });
+  }
+
+  async function decryptEntry(f, e) {
+    if (e.deleted) return e;
+    const key = e.keyRef === 'a' ? S.dataKey : f.key?.key;
+    try {
+      const p = await Vault.open(key, e.ct, `${f.id}:${e.id}`);
+      return { ...e, kind: p.kind, date: p.date, body: p.body ?? null, fields: p.fields || {} };
+    } catch { return { ...e, unreadable: true }; }
+  }
+
+  // Decrypted view of a forecast. Cached per server entry, since entries
+  // never change once written.
+  const plainCache = new Map();
+  async function plainEntries(f) {
+    const out = [];
+    for (const e of S.raw[f.id]?.values() || []) {
+      if (!plainCache.has(e.id)) plainCache.set(e.id, await decryptEntry(f, e));
+      out.push(plainCache.get(e.id));
+    }
+    const resolved = resolveEntries(out);
+    return { entries: resolved.filter(e => !e.unreadable), unreadable: resolved.filter(e => e.unreadable).length };
+  }
+
+  const authorName = (f, e) => e.authorId === S.me.id ? 'You'
+    : e.authorRole === 'owner' ? f.ownerName : (f.subjectName || 'Her');
+
+  async function writeEntry(f, payload, visibility) {
+    const id = uid();
+    const privateEntry = visibility === 'private';
+    const key = privateEntry ? S.dataKey : f.key.key;
+    const ct = await Vault.seal(key, payload, `${f.id}:${id}`);
+    await save(f.id, [{ id, visibility, keyRef: privateEntry ? 'a' : 'f', ct }]);
+  }
+  const deleteEntry = (f, e) => save(f.id, [{ id: uid(), visibility: e.visibility, supersedes: e.id, deleted: true }]);
 
   // ── boot ─────────────────────────────────────────────────────────────
   async function boot() {
     const q = new URLSearchParams(location.search);
-    const invite = q.get('invite');
-    const fromLink = q.get('w');
+    const frag = new URLSearchParams(location.hash.slice(1));
+    const pending = {
+      invite: q.get('invite'), unlock: q.get('unlock'), k: frag.get('k'),
+    };
 
     let base = Local.get('worker');
-    if (!base && fromLink && okUrl(fromLink)) {
-      base = fromLink;
-      Local.set('worker', base);
-    }
+    const fromLink = q.get('w');
+    if (!base && fromLink && okUrl(fromLink)) { base = fromLink; Local.set('worker', base); }
     if (base) Api.setBase(base);
     Api.setSession(Local.get('session'));
 
-    if (!base) return gateWorker(invite);
-    if (invite) return gateJoin(invite);
-    if (!Local.get('session')) return gateSignIn();
+    if (!base) return gateWorker(() => route(pending));
+    route(pending);
+  }
 
-    try { await enterApp(); }
-    catch (e) {
+  async function route(pending) {
+    if (pending.invite) return gateJoin(pending.invite, pending.k);
+    if (!Local.get('session')) return gateSignIn();
+    try {
+      const me = await Api.me();
+      S.me = me.person;
+      S.dataKey = await Vault.loadDataKey(S.me.id);
+      if (!S.dataKey) return gateUnlock(() => enterApp(me.forecasts, pending));
+      await enterApp(me.forecasts, pending);
+    } catch (e) {
       if (e.status === 401) { Local.set('session', ''); return gateSignIn(); }
       showGate(h('div', { class: 'gate-card sheet' },
-        h('h2', { text: 'Can\u2019t reach the forecast' }),
-        h('p', { class: 'muted', text: e.message }),
+        ...gateHeader('Can\u2019t reach Forecast', e.message),
         h('button', { class: 'btn', type: 'button', onclick: () => location.reload() }, 'Try again')));
     }
   }
@@ -103,18 +163,15 @@
     const g = $('gate');
     g.replaceChildren(card);
     g.hidden = false;
+    window.scrollTo(0, 0);
   }
-
   function gateHeader(title, sub) {
-    return [
-      h('span', { class: 'gate-mark', html: ICON.mark }),
-      h('h1', { text: title }),
-      sub ? h('p', { class: 'muted', text: sub }) : null,
-    ];
+    return [h('span', { class: 'gate-mark', html: ICON.mark }), h('h1', { text: title }), sub ? h('p', { class: 'muted', text: sub }) : null];
   }
+  const backLink = () => h('button', { class: 'linky', type: 'button', onclick: gateSignIn }, 'Back');
 
   // ── gate: worker address ─────────────────────────────────────────────
-  function gateWorker(invite) {
+  function gateWorker(next) {
     const input = h('input', { type: 'url', placeholder: 'https://your-worker.workers.dev', autocomplete: 'off', spellcheck: 'false', inputmode: 'url' });
     const go = h('button', { class: 'btn', type: 'button' }, 'Connect');
     go.onclick = () => busy(go, async () => {
@@ -123,12 +180,11 @@
       if (!(await Api.ping(url))) return toast('That address did not answer as a Forecast worker.');
       Local.set('worker', url);
       Api.setBase(url);
-      invite ? gateJoin(invite) : gateSignIn();
+      next();
     });
     showGate(h('div', { class: 'gate-card sheet' },
       ...gateHeader('Forecast', 'A shared cycle forecast for the people you choose.'),
-      h('label', { class: 'field-group' },
-        h('span', { class: 'field-name', text: 'Sync address' }), input),
+      h('label', { class: 'field-group' }, h('span', { class: 'field-name', text: 'Sync address' }), input),
       go,
       h('p', { class: 'small muted', text: 'This is the worker address whoever set up Forecast gave you. It is stored on this device only.' })));
   }
@@ -136,99 +192,197 @@
   // ── gate: sign in ────────────────────────────────────────────────────
   function gateSignIn() {
     const gbox = h('div');
-    const card = h('div', { class: 'gate-card sheet' },
+    showGate(h('div', { class: 'gate-card sheet' },
       ...gateHeader('Forecast', 'A shared cycle forecast for the people you choose.'),
       gbox,
-      h('p', { class: 'gate-or', text: 'or' }),
-      h('button', { class: 'btn quiet', type: 'button', onclick: () => gateSignup() }, 'Create an account with a sign-up code'),
+      h('button', { class: 'btn', type: 'button', onclick: () => gateSignup() }, 'Create an account'),
+      h('button', { class: 'btn quiet', type: 'button', onclick: gateRecover }, 'Sign in with a recovery key'),
       h('button', { class: 'btn quiet', type: 'button', onclick: gatePasteInvite }, 'I have an invite link'),
-      h('button', { class: 'linky', type: 'button',
-        onclick: () => { Local.set('worker', ''); location.reload(); } }, 'Use a different sync address'));
-    showGate(card);
+      h('button', { class: 'linky', type: 'button', onclick: () => { Local.set('worker', ''); location.reload(); } }, 'Use a different sync address')));
     renderGoogle(gbox, 'signin');
   }
 
+  function nicknameField() {
+    return h('input', { type: 'text', placeholder: 'A nickname, not your full name', autocomplete: 'nickname', maxlength: 24 });
+  }
+
+  // ── gate: create account ─────────────────────────────────────────────
   // `google` is an ID token from a Google sign-in that matched no account.
-  // Rather than dead-ending, carry it into sign-up and link it as soon as
-  // the account exists. Google tokens last about an hour, which is plenty.
-  function gateSignup(google = null) {
-    let suggested = '';
-    if (google) {
-      try { suggested = JSON.parse(atob(google.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).given_name || ''; } catch {}
-    }
-    const name = h('input', { type: 'text', placeholder: 'Chris', autocomplete: 'given-name', maxlength: 60, value: suggested });
-    const code = h('input', { type: 'text', placeholder: 'Sign-up code', autocomplete: 'off', spellcheck: 'false' });
+  async function gateSignup(google = null) {
+    const nick = nicknameField();
+    const adult = check('I\u2019m 18 or older');
+    const ts = h('div');
     const go = h('button', { class: 'btn', type: 'button' }, 'Create account');
-    go.onclick = () => busy(go, async () => {
-      if (!name.value.trim()) return toast('Enter your name.');
-      const r = await Api.signup(name.value.trim(), code.value.trim());
-      Local.set('session', r.sessionId);
-      Api.setSession(r.sessionId);
-      if (google) {
-        try { await Api.googleLink(google); }
-        catch { toast('Account created. Link Google from Settings to finish.'); }
-      }
-      await enterApp();
-    });
     showGate(h('div', { class: 'gate-card sheet' },
       ...gateHeader('Create an account', google
-        ? 'That Google account isn\u2019t set up yet. Enter your sign-up code and it will be linked to your new account.'
-        : 'The sign-up code is the SIGNUP_TOKEN set on your worker. People you invite never need it.'),
-      h('label', { class: 'field-group' }, h('span', { class: 'field-name', text: 'Your name' }), name),
-      h('label', { class: 'field-group' }, h('span', { class: 'field-name', text: 'Sign-up code' }), code),
-      go,
-      h('p', { class: 'small muted', text: 'Invited by someone? Use their invite link instead. You don\u2019t need a code.' }),
-      h('button', { class: 'linky', type: 'button', onclick: gateSignIn }, 'Back')));
+        ? 'That Google account isn\u2019t set up yet. Pick a nickname and it will be linked to your new account.'
+        : 'Just a nickname. No email, no full name.'),
+      h('label', { class: 'field-group' }, h('span', { class: 'field-name', text: 'Nickname' }), nick),
+      adult, ts, go,
+      h('p', { class: 'small muted', text: 'Invited by someone? Use their invite link instead.' }),
+      backLink()));
+    const token = await renderTurnstile(ts);
+
+    go.onclick = () => busy(go, async () => {
+      if (!nick.value.trim()) return toast('Choose a nickname.');
+      if (!adult.checked()) return toast('Forecast is for adults 18 and over.');
+      const id = await Vault.newIdentity();
+      const r = await Api.signup({
+        displayName: nick.value.trim(), loginSecret: id.loginSecret, wrappedDataKey: id.wrappedDataKey,
+        adult: true, turnstileToken: token(), idToken: google || undefined,
+      });
+      await Vault.saveDataKey(r.person.id, id.dataKey);
+      Local.set('session', r.sessionId);
+      Api.setSession(r.sessionId);
+      gateShowRecovery(id.recoveryText, () => route({}));
+    });
+  }
+
+  // ── gate: show a recovery key once ───────────────────────────────────
+  function gateShowRecovery(text, next, intro) {
+    const saved = check('I\u2019ve saved my recovery key somewhere safe');
+    const go = h('button', { class: 'btn', type: 'button' }, 'Continue');
+    go.onclick = () => { if (!saved.checked()) return toast('Save your recovery key first.'); next(); };
+    showGate(h('div', { class: 'gate-card sheet' },
+      ...gateHeader('Your recovery key', intro || 'This is the only way back into your account on a new device. Nobody else has a copy, including whoever runs this site, so it can\u2019t be reset for you.'),
+      h('p', { class: 'recovery', text: text }),
+      h('div', { class: 'row' },
+        h('button', { class: 'btn quiet', type: 'button', onclick: async () => {
+          try { await navigator.clipboard.writeText(text); toast('Copied'); } catch { toast('Select the key and copy it'); }
+        } }, 'Copy'),
+        h('button', { class: 'btn quiet', type: 'button', onclick: () => download('forecast-recovery-key.txt',
+          `Forecast recovery key\n\n${text}\n\nKeep this private. Anyone with it can open your account.\n`, 'text/plain') }, 'Download')),
+      h('p', { class: 'small muted', text: 'A password manager is a good place for it.' }),
+      saved, go));
+  }
+
+  function download(name, text, type = 'application/json') {
+    const url = URL.createObjectURL(new Blob([text], { type }));
+    const a = h('a', { href: url, download: name });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  // ── gate: sign in with a recovery key ────────────────────────────────
+  function gateRecover() {
+    const input = h('textarea', { placeholder: 'XXXX-XXXX-XXXX-…', spellcheck: 'false', autocomplete: 'off', rows: 3, class: 'mono' });
+    const go = h('button', { class: 'btn', type: 'button' }, 'Sign in');
+    go.onclick = () => busy(go, async () => {
+      const d = await Vault.fromRecoveryText(input.value);
+      if (!d) return toast('That isn\u2019t a complete recovery key.');
+      const r = await Api.recover(d.loginSecret);
+      const key = await d.unwrap(r.person.wrappedDataKey);
+      if (!key) return toast('That key didn\u2019t unlock the account.');
+      await Vault.saveDataKey(r.person.id, key);
+      Local.set('session', r.sessionId);
+      Api.setSession(r.sessionId);
+      route({});
+    });
+    showGate(h('div', { class: 'gate-card sheet' },
+      ...gateHeader('Sign in with your recovery key'),
+      input, go, backLink()));
+  }
+
+  // ── gate: signed in, but this device has no data key ─────────────────
+  function gateUnlock(next) {
+    const input = h('textarea', { placeholder: 'XXXX-XXXX-XXXX-…', spellcheck: 'false', autocomplete: 'off', rows: 3, class: 'mono' });
+    const go = h('button', { class: 'btn', type: 'button' }, 'Unlock');
+    go.onclick = () => busy(go, async () => {
+      const d = await Vault.fromRecoveryText(input.value);
+      const key = d && await d.unwrap(S.me.wrappedDataKey);
+      if (!key) return toast('That recovery key doesn\u2019t match this account.');
+      await Vault.saveDataKey(S.me.id, key);
+      S.dataKey = key;
+      next();
+    });
+    const lost = h('button', { class: 'linky', type: 'button' }, 'I lost my recovery key');
+    lost.onclick = () => busy(lost, async () => {
+      if (!confirm('This makes a new recovery key and a new data key. Your private notes become permanently unreadable, and each shared forecast stays locked until the other person sends you an unlock link. Continue?')) return;
+      const id = await Vault.newIdentity();
+      const r = await Api.rekey({ loginSecret: id.loginSecret, wrappedDataKey: id.wrappedDataKey });
+      S.me = r.person;
+      await Vault.saveDataKey(S.me.id, id.dataKey);
+      S.dataKey = id.dataKey;
+      gateShowRecovery(id.recoveryText, next, 'Your new recovery key. The old one no longer works.');
+    });
+    showGate(h('div', { class: 'gate-card sheet' },
+      ...gateHeader(`Welcome back, ${S.me.displayName}`, 'Enter your recovery key to unlock your forecasts on this device.'),
+      input, go, lost,
+      h('button', { class: 'linky', type: 'button', onclick: signOut }, 'Sign out')));
   }
 
   function gatePasteInvite() {
     const input = h('input', { type: 'text', placeholder: 'Paste the whole link', spellcheck: 'false' });
     const go = h('button', { class: 'btn', type: 'button' }, 'Continue');
     go.onclick = () => {
-      const v = input.value.trim();
-      const m = v.match(/invite=([A-Za-z0-9_-]{16,})/) || v.match(/^([A-Za-z0-9_-]{16,})$/);
-      if (!m) return toast('That doesn\u2019t look like an invite link.');
-      const w = v.match(/[?&]w=([^&]+)/);
-      if (w && !Api.getBase()) { const url = decodeURIComponent(w[1]); if (okUrl(url)) { Local.set('worker', url); Api.setBase(url); } }
-      gateJoin(m[1]);
+      let u;
+      try { u = new URL(input.value.trim()); } catch { return toast('Paste the complete link, starting with https.'); }
+      const token = u.searchParams.get('invite');
+      if (!token) return toast('That doesn\u2019t look like an invite link.');
+      const w = u.searchParams.get('w');
+      if (w && !Api.getBase() && okUrl(w)) { Local.set('worker', w); Api.setBase(w); }
+      gateJoin(token, new URLSearchParams(u.hash.slice(1)).get('k'));
     };
-    showGate(h('div', { class: 'gate-card sheet' },
-      ...gateHeader('Join with an invite'), input, go,
-      h('button', { class: 'linky', type: 'button', onclick: gateSignIn }, 'Back')));
+    showGate(h('div', { class: 'gate-card sheet' }, ...gateHeader('Join with an invite'), input, go, backLink()));
   }
 
-  // ── gate: join from invite ───────────────────────────────────────────
-  async function gateJoin(token) {
+  // ── gate: join from an invite ────────────────────────────────────────
+  async function gateJoin(token, kText) {
+    const fail = (title, msg) => showGate(h('div', { class: 'gate-card sheet' },
+      ...gateHeader(title, msg),
+      h('button', { class: 'btn quiet', type: 'button', onclick: () => { cleanUrl(); gateSignIn(); } }, 'Go to sign in')));
+
     let preview;
     try { preview = await Api.invitePreview(token); }
-    catch (e) {
-      return showGate(h('div', { class: 'gate-card sheet' },
-        ...gateHeader('This invite can\u2019t be used', e.message),
-        h('p', { class: 'muted', text: 'Ask whoever sent it for a new link.' }),
-        h('button', { class: 'btn quiet', type: 'button', onclick: () => { history.replaceState(null, '', location.pathname); gateSignIn(); } }, 'Go to sign in')));
+    catch (e) { return fail('This invite can\u2019t be used', `${e.message}. Ask whoever sent it for a new link.`); }
+
+    const raw = Vault.parseFragmentKey(kText);
+    const fk = raw && await Vault.forecastFromRaw(raw, preview.forecastId, preview.kcv);
+    if (!fk) return fail('This link is incomplete', 'Part of the link is missing or changed, often because a messaging app cut it off. Ask for it to be sent again, ideally by copy and paste.');
+
+    // Already signed in here? Attach to that account, after unlocking it.
+    let me = null;
+    if (Local.get('session')) { try { me = await Api.me(); } catch {} }
+    if (me) {
+      S.me = me.person;
+      S.dataKey = await Vault.loadDataKey(S.me.id);
+      if (!S.dataKey) return gateUnlock(() => gateJoin(token, kText));
     }
 
-    // Already signed in on this device? Attach to that account instead of
-    // making a second one.
-    let existing = null;
-    if (Local.get('session')) { try { existing = (await Api.me()).person; } catch {} }
-
     const owner = preview.ownerName;
-    const name = h('input', { type: 'text', placeholder: 'Your first name', autocomplete: 'given-name', maxlength: 60 });
-    const start = h('input', { type: 'date', max: Dates.today() });
+    const nick = nicknameField();
+    const adult = check('I\u2019m 18 or older');
     const go = h('button', { class: 'btn', type: 'button' }, 'Accept invite');
+    const start = h('input', { type: 'date', max: Dates.today() });
 
     go.onclick = () => busy(go, async () => {
-      if (!existing && !name.value.trim()) return toast('Enter your name.');
-      const r = await Api.redeem({
-        inviteToken: token,
-        displayName: existing ? undefined : name.value.trim(),
-        periodStart: start.value || undefined,
-      });
-      history.replaceState(null, '', location.pathname);
-      S.active = r.forecastId;
+      if (!me && !nick.value.trim()) return toast('Choose a nickname.');
+      if (!adult.checked()) return toast('Forecast is for adults 18 and over.');
+      let r, id = null;
+      if (me) {
+        r = await Api.redeem({ inviteToken: token, adult: true,
+          wrappedKey: await Vault.wrapForecast(S.dataKey, raw, preview.forecastId) });
+      } else {
+        id = await Vault.newIdentity();
+        r = await Api.redeem({ inviteToken: token, adult: true,
+          wrappedKey: await Vault.wrapForecast(id.dataKey, raw, preview.forecastId),
+          signup: { displayName: nick.value.trim(), loginSecret: id.loginSecret, wrappedDataKey: id.wrappedDataKey } });
+        await Vault.saveDataKey(r.person.id, id.dataKey);
+        S.dataKey = id.dataKey;
+      }
+      S.me = r.person;
+      Local.set('session', r.sessionId);
+      Api.setSession(r.sessionId);
       Local.set('tab', r.forecastId);
-      await afterSession(r.sessionId);
+      cleanUrl();
+      if (start.value) {
+        const f = { id: r.forecastId, key: fk };
+        const eid = uid();
+        await Api.write(f.id, [{ id: eid, visibility: 'shared', keyRef: 'f',
+          ct: await Vault.seal(fk.key, { kind: 'period', date: start.value }, `${f.id}:${eid}`) }]);
+      }
+      if (id) gateShowRecovery(id.recoveryText, () => route({}));
+      else route({});
     });
 
     showGate(h('div', { class: 'gate-card sheet' },
@@ -237,65 +391,85 @@
         h('strong', { text: 'What gets shared' }),
         h('ul', {},
           h('li', { text: `${owner} sees your period start dates and anything you mark Shared.` }),
-          h('li', { text: 'Anything you mark Only me stays private to you.' }),
+          h('li', { text: 'Anything you mark Only me is encrypted so only you can read it.' }),
           h('li', { text: `${owner} can also keep private notes you won\u2019t see.` }),
-          h('li', { text: 'You can stop sharing at any time, and choose to erase what you shared.' }))),
-      existing
-        ? h('p', { text: `You\u2019ll join as ${existing.displayName}.` })
-        : h('label', { class: 'field-group' }, h('span', { class: 'field-name', text: 'Your name' }), name),
-      h('label', { class: 'field-group' },
-        h('span', { class: 'field-name', text: 'First day of your last period (optional)' }), start),
-      go,
+          h('li', { text: `You can stop sharing at any time, and erase what you shared. ${owner} isn\u2019t notified.` }),
+          h('li', { text: 'Everything is end-to-end encrypted. Whoever runs this site can\u2019t read it.' }))),
+      me ? h('p', { text: `You\u2019ll join as ${S.me.displayName}.` })
+         : h('label', { class: 'field-group' }, h('span', { class: 'field-name', text: 'Nickname' }), nick),
+      h('label', { class: 'field-group' }, h('span', { class: 'field-name', text: 'First day of your last period (optional)' }), start),
+      adult, go,
       h('p', { class: 'small muted', text: 'Cycle predictions are estimates. They are not medical advice or birth control.' })));
   }
 
-  async function afterSession(sid) {
-    Local.set('session', sid);
-    Api.setSession(sid);
-    await enterApp();
+  // ── Google and Turnstile ─────────────────────────────────────────────
+  async function config() {
+    try { return S.gConfig ||= await Api.config(); } catch { return {}; }
   }
-
-  // ── Google ───────────────────────────────────────────────────────────
-  async function renderGoogle(host, mode) {
-    try { S.gConfig = S.gConfig || await Api.config(); } catch { return; }
-    if (!S.gConfig.googleEnabled) return;
-    await new Promise(res => {
-      if (window.google?.accounts?.id) return res();
-      const s = h('script', { src: 'https://accounts.google.com/gsi/client', async: true });
+  function loadScript(src) {
+    return new Promise(res => {
+      if ([...document.scripts].some(s => s.src === src)) return res();
+      const s = h('script', { src, async: true });
       s.onload = res; s.onerror = res;
       document.head.append(s);
     });
+  }
+
+  async function renderGoogle(host, mode) {
+    const cfg = await config();
+    if (!cfg.googleEnabled) return;
+    await loadScript('https://accounts.google.com/gsi/client');
     if (!window.google?.accounts?.id) return;
     google.accounts.id.initialize({
-      client_id: S.gConfig.googleClientId,
+      client_id: cfg.googleClientId,
       callback: async ({ credential }) => {
         try {
           if (mode === 'link') {
-            await Api.googleLink(credential);
-            S.me.hasGoogle = true;
-            toast('Google linked. You can sign in on any device now.');
+            const r = await Api.googleLink(credential);
+            S.me = r.person;
+            toast('Google linked. You can use it to sign in on another device.');
             closePanel();
-          } else {
-            try {
-              const r = await Api.google(credential);
-              await afterSession(r.sessionId);
-            } catch (e) {
-              if (e.status === 404) return gateSignup(credential);
-              throw e;
-            }
+            return;
+          }
+          try {
+            const r = await Api.google(credential);
+            Local.set('session', r.sessionId);
+            Api.setSession(r.sessionId);
+            route({});
+          } catch (e) {
+            if (e.status === 404) return gateSignup(credential);
+            throw e;
           }
         } catch (e) { toast(e.message); }
       },
     });
-    google.accounts.id.renderButton(host, { theme: 'outline', size: 'large', width: 300,
-      text: mode === 'link' ? 'signin_with' : 'continue_with' });
+    google.accounts.id.renderButton(host, { theme: 'outline', size: 'large', width: 300, text: mode === 'link' ? 'signin_with' : 'continue_with' });
+  }
+
+  // Returns a function that yields the current token ('' when Turnstile is
+  // not configured on the worker).
+  async function renderTurnstile(host) {
+    let token = '';
+    const cfg = await config();
+    if (!cfg.turnstileSiteKey) return () => token;
+    await loadScript('https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit');
+    if (window.turnstile) {
+      window.turnstile.render(host, {
+        sitekey: cfg.turnstileSiteKey,
+        callback: t => { token = t; },
+        'expired-callback': () => { token = ''; },
+      });
+    }
+    return () => token;
   }
 
   // ── app ──────────────────────────────────────────────────────────────
-  async function enterApp() {
-    const me = await Api.me();
-    S.me = me;
-    S.forecasts = me.forecasts;
+  async function enterApp(forecasts, pending = {}) {
+    S.forecasts = [];
+    for (const f of forecasts) S.forecasts.push(await decorate(f));
+
+    if (pending.unlock) await applyUnlockLink(pending.unlock, pending.k);
+
     const saved = S.active || Local.get('tab');
     S.active = S.forecasts.some(f => f.id === saved) ? saved : S.forecasts[0]?.id || null;
 
@@ -304,36 +478,50 @@
     $('brand').replaceChildren(h('span', { html: ICON.mark, style: 'display:inline-flex' }), 'Forecast');
     $('settingsBtn').innerHTML = ICON.gear;
     $('settingsBtn').onclick = openSettings;
-
     renderTabs();
     if (S.active) await refresh(S.active, true);
-    render();
+    await render();
   }
+
+  // An unlock link carries a forecast key for a member whose device lost
+  // it. It only works for someone who is already a member.
+  async function applyUnlockLink(fid, kText) {
+    cleanUrl();
+    const f = S.forecasts.find(x => x.id === fid);
+    const raw = Vault.parseFragmentKey(kText);
+    if (!f) return toast('That unlock link is for a forecast you aren\u2019t part of.');
+    const fk = raw && await Vault.forecastFromRaw(raw, f.id, f.kcv);
+    if (!fk) return toast('That unlock link is incomplete or doesn\u2019t match.');
+    await Api.putKey(f.id, await Vault.wrapForecast(S.dataKey, raw, f.id));
+    f.wrappedKey = await Vault.wrapForecast(S.dataKey, raw, f.id);
+    await decorate(f);
+    S.active = f.id; Local.set('tab', f.id);
+    toast('Forecast unlocked on this device');
+  }
+
+  const tabName = f => f.role === 'owner' ? f.label : `Shared with ${f.ownerName}`;
 
   function renderTabs() {
     const tabs = S.forecasts.map(f => h('button', {
-      class: 'tab', role: 'tab', type: 'button',
-      'aria-selected': String(f.id === S.active),
+      class: 'tab', role: 'tab', type: 'button', 'aria-selected': String(f.id === S.active),
       onclick: async () => {
         S.active = f.id; Local.set('tab', f.id);
-        renderTabs(); render();
+        renderTabs(); await render();
         await refresh(f.id, !S.raw[f.id]);
-        render();
+        await render();
       },
-    }, f.role === 'owner' ? f.label : `Shared with ${f.ownerName}`,
-       f.role === 'owner' && !f.subjectId ? h('span', { class: 'tag', text: 'invite' }) : null));
-    if (S.me.person.canOwn) {
-      tabs.push(h('button', { class: 'tab', type: 'button', 'aria-label': 'Add a forecast', onclick: openNewForecast }, '+ Add'));
-    }
+    }, tabName(f),
+       f.locked ? h('span', { class: 'tag', text: 'locked' })
+       : f.role === 'owner' && !f.subjectId ? h('span', { class: 'tag', text: 'invite' }) : null));
+    tabs.push(h('button', { class: 'tab', type: 'button', 'aria-label': 'Add a forecast', onclick: openNewForecast }, '+ Add'));
     $('tabs').replaceChildren(...tabs);
   }
 
-  // Full pull on first open, then incremental with a five minute overlap
-  // to absorb KV list lag. Entries are immutable, so overlap is free.
   async function refresh(fid, full) {
+    const f = S.forecasts.find(x => x.id === fid);
+    if (!f || f.locked) return;
     if (full || !S.raw[fid]) { S.raw[fid] = new Map(); S.cursor[fid] = ''; }
-    let since = S.cursor[fid]
-      ? String(Math.max(0, +S.cursor[fid] - 300000)).padStart(13, '0') : '';
+    let since = S.cursor[fid] ? String(Math.max(0, +S.cursor[fid] - 300000)).padStart(13, '0') : '';
     for (let page = 0; page < 20; page++) {
       const r = await Api.sync(fid, since);
       for (const e of r.entries) S.raw[fid].set(e.id, e);
@@ -346,68 +534,98 @@
   async function save(fid, entries) {
     const r = await Api.write(fid, entries);
     for (const e of r.written) S.raw[fid].set(e.id, e);
-    render();
+    await render();
   }
 
   // ── render ───────────────────────────────────────────────────────────
-  function render() {
-    const main = $('main');
+  let renderSeq = 0;
+  async function render() {
+    const seq = ++renderSeq;
     const f = activeForecast();
-    if (!f) {
-      main.replaceChildren(S.me.person.canOwn ? emptyOwner() : emptySubject());
-      return;
+    let kids;
+    if (!f) kids = [emptyState()];
+    else if (f.locked) kids = [lockedView(f)];
+    else {
+      const { entries, unreadable } = await plainEntries(f);
+      kids = f.role === 'owner' ? ownerView(f, entries) : subjectView(f, entries);
+      if (unreadable) kids.push(h('p', { class: 'small muted', style: 'text-align:center',
+        text: `${unreadable} older ${unreadable === 1 ? 'entry was' : 'entries were'} sealed with a key this device no longer has.` }));
     }
-    main.replaceChildren(...(f.role === 'owner' ? ownerView(f) : subjectView(f)));
+    if (seq === renderSeq) $('main').replaceChildren(...kids);
   }
 
-  function emptyOwner() {
+  function emptyState() {
     return h('section', { class: 'sheet' },
       h('h2', { text: 'Start your first forecast' }),
-      h('p', { class: 'muted', text: 'Each forecast is one person. Create one, send her the invite link, and once she accepts she can set day one of her cycle and log how she\u2019s feeling.' }),
+      h('p', { class: 'muted', text: 'Each forecast is one person. Create one and send her the invite link. When she accepts, she can set day one of her cycle and log how she\u2019s feeling.' }),
       h('button', { class: 'btn', type: 'button', onclick: openNewForecast }, 'Create a forecast'));
   }
-  function emptySubject() {
+
+  function lockedView(f) {
+    const other = f.role === 'owner' ? f.subjectName : f.ownerName;
     return h('section', { class: 'sheet' },
-      h('h2', { text: 'Nothing shared with you right now' }),
-      h('p', { class: 'muted', text: 'If someone sends you a new invite link, open it on this device to join.' }));
+      h('h2', { text: 'Locked on this device' }),
+      h('p', { class: 'muted', text: other
+        ? `This forecast was sealed with a key this account no longer has. Ask ${other} to send you an unlock link from Settings.`
+        : 'This forecast was sealed with a key this account no longer has, and nobody else holds it. You can delete it from Settings and start a new one.' }));
   }
 
   function cycleOf(f, entries) {
-    const starts = entries.filter(e => e.kind === 'period').map(e => e.date);
-    return Cycle.compute(starts, f);
+    return Cycle.compute(entries.filter(e => e.kind === 'period').map(e => e.date), f);
   }
 
   // ── owner ────────────────────────────────────────────────────────────
-  function ownerView(f) {
-    const entries = entriesFor(f.id);
+  function ownerView(f, entries) {
     const cycle = cycleOf(f, entries);
     const today = Dates.today();
     const readings = readingsFor(entries, today, f.subjectId);
     const herName = f.subjectName || f.label;
+    const partner = f.relation === 'partner';
     const out = [];
 
     if (!f.subjectId) out.push(inviteCard(f));
     out.push(hero(cycle, herName));
-    out.push(todayCard(readings, f.relation === 'partner', herName, f.subjectId ? 'her' : null));
+    out.push(todayCard(readings, partner, herName, f.subjectId ? 'her' : null));
 
     const adv = Advisory.forOwner({ cycle, readings, relation: f.relation, name: herName, date: today });
     out.push(h('section', { class: 'advisory' + (/Clear|Fair/.test(adv.headline) ? ' fair' : '') },
       h('h2', { text: adv.headline }),
       h('ul', {}, adv.lines.map(l => h('li', { text: l }))),
-      h('p', { class: 'motto', text: f.relation === 'partner'
+      h('p', { class: 'motto', text: partner
         ? 'Helping husbands navigate the changing climate of marriage, one hormonal front at a time.'
         : 'Helping you be the one who remembers.' })));
 
     const other = f.subjectId ? f.subjectName : null;
     out.push(composer(`Log ${herName}\u2019s readings`, readingForm({
-      showDesire: f.relation === 'partner', otherName: other, defaultVis: 'shared',
-      onSave: (fields, body, vis, date) => save(f.id, [{ id: uid(), kind: 'reading', date, fields, body, visibility: vis }]),
+      showDesire: partner, otherName: other, defaultVis: 'shared',
+      onSave: (fields, body, vis, date) => writeEntry(f, { kind: 'reading', date, fields, body }, vis),
     })));
     out.push(composer('Add a note', noteForm({ otherName: other, defaultVis: 'private',
-      onSave: (body, vis, date) => save(f.id, [{ id: uid(), kind: 'note', date, body, visibility: vis }]) })));
-    out.push(composer('Log a period start', periodForm(d => save(f.id, [{ id: uid(), kind: 'period', date: d }]))));
+      onSave: (body, vis, date) => writeEntry(f, { kind: 'note', date, body }, vis) })));
+    out.push(composer('Log a period start', periodForm(d => writeEntry(f, { kind: 'period', date: d }, 'shared'))));
     out.push(timeline(f, entries));
     return out;
+  }
+
+  function linkWithKey(params, raw) {
+    const url = new URL(location.pathname, location.origin);
+    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+    url.searchParams.set('w', Api.getBase());
+    url.hash = 'k=' + Vault.fragmentKey(raw);
+    return url.toString();
+  }
+
+  function linkBox(link, note) {
+    const field = h('input', { type: 'text', readonly: true, value: link });
+    const copy = h('button', { class: 'btn quiet', type: 'button', onclick: async () => {
+      try { await navigator.clipboard.writeText(link); toast('Link copied'); }
+      catch { field.select(); toast('Select and copy the link'); }
+    } }, 'Copy');
+    const share = navigator.share ? h('button', { class: 'btn quiet', type: 'button', onclick: async () => {
+      try { await navigator.share({ title: 'Forecast', url: link }); } catch {}
+    } }, 'Share') : null;
+    return h('div', {}, h('div', { class: 'row' }, h('div', { class: 'grow' }, field), copy, share),
+      h('p', { class: 'small muted', text: note }));
   }
 
   function inviteCard(f) {
@@ -416,23 +634,8 @@
     make.onclick = () => busy(make, async () => {
       const r = await Api.invite(f.id);
       f.hasPendingInvite = true;
-      const url = new URL(location.pathname, location.origin);
-      url.searchParams.set('invite', r.token);
-      // The address rides along in the link, so the person you invite
-      // never has to type it.
-      url.searchParams.set('w', Api.getBase());
-      const link = url.toString();
-      const field = h('input', { type: 'text', readonly: true, value: link });
-      const copy = h('button', { class: 'btn quiet', type: 'button', onclick: async () => {
-        try { await navigator.clipboard.writeText(link); toast('Link copied'); }
-        catch { field.select(); toast('Select and copy the link'); }
-      } }, 'Copy');
-      const share = navigator.share ? h('button', { class: 'btn quiet', type: 'button', onclick: async () => {
-        try { await navigator.share({ title: 'Forecast invite', text: `${S.me.person.displayName} invited you to Forecast`, url: link }); } catch {}
-      } }, 'Share') : null;
-      result.replaceChildren(
-        h('div', { class: 'row' }, h('div', { class: 'grow' }, field), copy, share),
-        h('p', { class: 'small muted', text: `Works once and expires ${new Date(r.expiresAt).toLocaleDateString()}. Making a new link cancels this one.` }));
+      result.replaceChildren(linkBox(linkWithKey({ invite: r.token }, f.key.raw),
+        `Works once and expires ${new Date(r.expiresAt).toLocaleDateString()}. The link holds the key to this forecast, so send it only to her. Making a new link cancels this one.`));
       renderTabs();
     });
     return h('section', { class: 'sheet' },
@@ -443,29 +646,23 @@
   }
 
   // ── subject ──────────────────────────────────────────────────────────
-  function subjectView(f) {
-    const entries = entriesFor(f.id);
+  function subjectView(f, entries) {
     const cycle = cycleOf(f, entries);
-    const today = Dates.today();
-    const readings = readingsFor(entries, today, S.me.person.id);
-    const out = [];
-
-    out.push(hero(cycle, null));
+    const readings = readingsFor(entries, Dates.today(), S.me.id);
     const o = Advisory.forSubject({ cycle });
-    out.push(h('section', { class: 'sheet' },
-      h('h2', { text: 'Your outlook' }),
-      ...o.lines.map(l => h('p', { text: l }))));
-    out.push(todayCard(readings, f.asksDesire, 'You', null));
-
-    out.push(composer('Today\u2019s check-in', readingForm({
-      showDesire: f.asksDesire, otherName: f.ownerName, defaultVis: 'shared',
-      onSave: (fields, body, vis, date) => save(f.id, [{ id: uid(), kind: 'reading', date, fields, body, visibility: vis }]),
-    }), true));
-    out.push(composer('Add a note', noteForm({ otherName: f.ownerName, defaultVis: 'private',
-      onSave: (body, vis, date) => save(f.id, [{ id: uid(), kind: 'note', date, body, visibility: vis }]) })));
-    out.push(composer('My period started', periodForm(d => save(f.id, [{ id: uid(), kind: 'period', date: d }]))));
-    out.push(timeline(f, entries));
-    return out;
+    return [
+      hero(cycle, null),
+      h('section', { class: 'sheet' }, h('h2', { text: 'Your outlook' }), ...o.lines.map(l => h('p', { text: l }))),
+      todayCard(readings, f.asksDesire, 'You', null),
+      composer('Today\u2019s check-in', readingForm({
+        showDesire: f.asksDesire, otherName: f.ownerName, defaultVis: 'shared',
+        onSave: (fields, body, vis, date) => writeEntry(f, { kind: 'reading', date, fields, body }, vis),
+      }), true),
+      composer('Add a note', noteForm({ otherName: f.ownerName, defaultVis: 'private',
+        onSave: (body, vis, date) => writeEntry(f, { kind: 'note', date, body }, vis) })),
+      composer('My period started', periodForm(d => writeEntry(f, { kind: 'period', date: d }, 'shared'))),
+      timeline(f, entries),
+    ];
   }
 
   // ── hero dial ────────────────────────────────────────────────────────
@@ -690,7 +887,7 @@
 
   // ── timeline ─────────────────────────────────────────────────────────
   function timeline(f, entries) {
-    const me = S.me.person.id;
+    const me = S.me.id;
     const starts = entries.filter(e => e.kind === 'period').map(e => e.date);
     const groups = new Map();
     for (const e of entries.slice(0, 120)) {
@@ -706,8 +903,7 @@
 
   function entryRow(f, e, me) {
     const mine = e.authorId === me;
-    const who = mine ? 'You' : e.authorName;
-    const meta = h('div', { class: 'entry-meta' }, h('span', { text: who }));
+    const meta = h('div', { class: 'entry-meta' }, h('span', { text: authorName(f, e) }));
     if (e.kind === 'period') meta.append(h('span', { class: 'badge period' }, icon('drop'), 'Period started'));
     else meta.append(e.visibility === 'private'
       ? h('span', { class: 'badge private' }, icon('lock'), 'Only you')
@@ -715,7 +911,7 @@
 
     const del = mine ? h('button', { class: 'linky small', type: 'button', onclick: async ev => {
       if (!confirm('Delete this entry?')) return;
-      await busy(ev.currentTarget, () => save(f.id, [{ id: uid(), kind: e.kind, date: e.date, supersedes: e.id, deleted: true }]));
+      await busy(ev.currentTarget, () => deleteEntry(f, e));
     } }, 'Delete') : h('span');
 
     let content = null;
@@ -750,27 +946,42 @@
   const panelHead = title => h('div', { class: 'sheet-head' }, h('h2', { text: title }),
     h('button', { class: 'linky', type: 'button', onclick: closePanel }, 'Done'));
 
+  // ── creating a forecast ──────────────────────────────────────────────
+  function relationSeg(value) {
+    const s = seg([['partner', 'Partner'], ['family', 'Family'], ['friend', 'Friend']]);
+    s.setValue(value);
+    return s;
+  }
+  const sealShared = (f, shared) => Vault.seal(f.key.key, shared, `shared:${f.id}`);
+  const sealOwner = (fid, own) => Vault.seal(S.dataKey, own, `owner:${fid}`);
+
   function openNewForecast() {
-    const label = h('input', { type: 'text', placeholder: 'Wife, Sister, Jess', maxlength: 40 });
-    const rel = seg([['partner', 'Partner'], ['family', 'Family'], ['friend', 'Friend']]);
-    rel.setValue('partner');
+    const label = h('input', { type: 'text', placeholder: 'Wife, Sister, Jess', maxlength: 24 });
+    const rel = relationSeg('partner');
     const go = h('button', { class: 'btn', type: 'button' }, 'Create forecast');
     go.onclick = () => busy(go, async () => {
       if (!label.value.trim()) return toast('Give the tab a name.');
-      const r = await Api.createForecast(label.value.trim(), rel.getValue() || 'partner');
-      S.forecasts.push(r.forecast);
-      S.active = r.forecast.id; Local.set('tab', S.active);
-      S.raw[S.active] = new Map();
-      closePanel(); renderTabs(); render();
+      const fid = uid(12);
+      const relation = rel.getValue() || 'partner';
+      const k = await Vault.newForecast(fid, S.dataKey);
+      const r = await Api.createForecast({
+        id: fid, kcv: k.kcv, wrappedKey: k.wrappedKey,
+        sharedEnc: await Vault.seal(k.key, { ...DEFAULT_SHARED, asksDesire: relation === 'partner' }, `shared:${fid}`),
+        ownerEnc: await sealOwner(fid, { label: label.value.trim(), relation }),
+      });
+      S.forecasts.push(await decorate(r.forecast));
+      S.active = fid; Local.set('tab', fid);
+      S.raw[fid] = new Map();
+      closePanel(); renderTabs(); await render();
     });
     openPanel(panelHead('New forecast'),
-      h('p', { class: 'muted', text: 'One forecast per person. Only you see the tab name.' }),
-      group('Tab name', label),
-      group('Relationship', rel),
+      h('p', { class: 'muted', text: 'One forecast per person. The tab name is encrypted, so only you can see it.' }),
+      group('Tab name', label), group('Relationship', rel),
       h('p', { class: 'small muted', text: 'Partner forecasts include the desire reading and the husband advisory. Family and friend forecasts leave those out.' }),
       go);
   }
 
+  // ── settings ─────────────────────────────────────────────────────────
   function openSettings() {
     const f = activeForecast();
     const sections = [panelHead('Settings')];
@@ -780,12 +991,16 @@
   }
 
   function cycleSettings(f) {
+    if (f.locked) return [];
     const cl = h('input', { type: 'number', min: 18, max: 60, value: f.cycleLength });
     const pl = h('input', { type: 'number', min: 1, max: 12, value: f.periodLength });
     const go = h('button', { class: 'btn quiet', type: 'button' }, 'Save cycle settings');
     go.onclick = () => busy(go, async () => {
-      const r = await Api.settings(f.id, { cycleLength: cl.value, periodLength: pl.value });
-      Object.assign(f, r.forecast); render(); toast('Saved');
+      const c = parseInt(cl.value, 10), p = parseInt(pl.value, 10);
+      if (!(c >= 18 && c <= 60) || !(p >= 1 && p <= 12)) return toast('Cycle 18 to 60 days, period 1 to 12.');
+      const shared = { cycleLength: c, periodLength: p, asksDesire: f.asksDesire };
+      const r = await Api.settings(f.id, { sharedEnc: await sealShared(f, shared) });
+      Object.assign(f, r.forecast); await decorate(f); await render(); toast('Saved');
     });
     return [
       h('div', { class: 'row' }, h('div', { class: 'grow' }, group('Typical cycle (days)', cl)), h('div', { class: 'grow' }, group('Period length (days)', pl))),
@@ -794,15 +1009,37 @@
     ];
   }
 
+  // Either member can send the other an unlock link if they lose their key.
+  function unlockLinkSection(f) {
+    if (f.locked) return null;
+    const other = f.role === 'owner' ? f.subjectName : f.ownerName;
+    if (!other) return null;
+    const out = h('div');
+    const make = h('button', { class: 'btn quiet', type: 'button', onclick: () => {
+      out.replaceChildren(linkBox(linkWithKey({ unlock: f.id }, f.key.raw),
+        `Only works for ${other}, while they\u2019re signed in. It holds the key to this forecast, so send it only to them.`));
+    } }, `Make an unlock link for ${other}`);
+    return h('div', { style: 'margin-top:20px' },
+      h('p', { class: 'small muted', text: `If ${other} gets a new device and loses their recovery key, this link reopens the forecast for them.` }),
+      make, out);
+  }
+
   function ownerSettings(f) {
-    const label = h('input', { type: 'text', value: f.label, maxlength: 40 });
-    const rel = seg([['partner', 'Partner'], ['family', 'Family'], ['friend', 'Friend']]);
-    rel.setValue(f.relation);
-    const saveBtn = h('button', { class: 'btn quiet', type: 'button' }, 'Save tab');
-    saveBtn.onclick = () => busy(saveBtn, async () => {
-      const r = await Api.settings(f.id, { label: label.value.trim(), relation: rel.getValue() || f.relation });
-      Object.assign(f, r.forecast); renderTabs(); render(); toast('Saved');
-    });
+    const parts = [h('h3', { text: f.label })];
+    if (!f.locked) {
+      const label = h('input', { type: 'text', value: f.label, maxlength: 24 });
+      const rel = relationSeg(f.relation);
+      const saveBtn = h('button', { class: 'btn quiet', type: 'button' }, 'Save tab');
+      saveBtn.onclick = () => busy(saveBtn, async () => {
+        const relation = rel.getValue() || f.relation;
+        const r = await Api.settings(f.id, {
+          ownerEnc: await sealOwner(f.id, { label: label.value.trim() || f.label, relation }),
+          sharedEnc: await sealShared(f, { cycleLength: f.cycleLength, periodLength: f.periodLength, asksDesire: relation === 'partner' }),
+        });
+        Object.assign(f, r.forecast); await decorate(f); renderTabs(); await render(); toast('Saved');
+      });
+      parts.push(group('Tab name', label), group('Relationship', rel), saveBtn, ...cycleSettings(f), unlockLinkSection(f));
+    }
 
     const danger = [];
     if (f.subjectId) {
@@ -811,76 +1048,135 @@
         if (!confirm(`${f.subjectName} will lose access to this forecast. What she already shared stays here. Continue?`)) return;
         await Api.remove(f.id);
         f.subjectId = null; f.subjectName = null;
-        closePanel(); renderTabs(); render(); toast('Sharing ended');
+        closePanel(); renderTabs(); await render(); toast('Sharing ended');
       });
       danger.push(rm);
     } else if (f.hasPendingInvite) {
       const c = h('button', { class: 'btn quiet', type: 'button' }, 'Cancel the open invite');
-      c.onclick = () => busy(c, async () => { await Api.cancelInvite(f.id); f.hasPendingInvite = false; closePanel(); renderTabs(); render(); toast('Invite cancelled'); });
+      c.onclick = () => busy(c, async () => { await Api.cancelInvite(f.id); f.hasPendingInvite = false; closePanel(); renderTabs(); await render(); toast('Invite cancelled'); });
       danger.push(c);
     }
     const del = h('button', { class: 'btn danger', type: 'button' }, 'Delete this forecast');
     del.onclick = () => busy(del, async () => {
       if (!confirm('This permanently deletes every entry on this forecast, for both of you. Continue?')) return;
-      let cur; for (let i = 0; i < 200; i++) { const r = await Api.destroy(f.id, cur); if (!r.more) break; cur = r.cursor; }
-      S.forecasts = S.forecasts.filter(x => x.id !== f.id);
-      delete S.raw[f.id];
-      S.active = S.forecasts[0]?.id || null; Local.set('tab', S.active || '');
-      closePanel(); renderTabs(); if (S.active) await refresh(S.active, true); render(); toast('Forecast deleted');
+      await destroyForecast(f);
+      closePanel(); await afterRemoval('Forecast deleted');
     });
     danger.push(del);
-
-    return h('section', { class: 'sheet' },
-      h('h3', { text: f.label }),
-      group('Tab name', label), group('Relationship', rel), saveBtn,
-      ...cycleSettings(f),
-      h('div', { style: 'display:grid;gap:10px;margin-top:20px' }, danger));
+    parts.push(h('div', { style: 'display:grid;gap:10px;margin-top:20px' }, danger));
+    return h('section', { class: 'sheet' }, ...parts);
   }
 
   function subjectSettings(f) {
+    const erase = check('Also erase everything I shared');
     const leave = h('button', { class: 'btn danger', type: 'button' }, `Stop sharing with ${f.ownerName}`);
-    const erase = h('input', { type: 'checkbox', id: 'eraseChk' });
     leave.onclick = () => busy(leave, async () => {
-      const msg = erase.checked
-        ? `Everything you wrote here will be deleted and ${f.ownerName} will lose access to your cycle. Continue?`
-        : `${f.ownerName} will stop receiving anything new from you. What you already shared stays with them. Continue?`;
+      const msg = erase.checked()
+        ? `Everything you wrote here will be deleted and ${f.ownerName} will lose access to your cycle. They won\u2019t be notified. Continue?`
+        : `${f.ownerName} will stop receiving anything new from you, and won\u2019t be notified. What you already shared stays with them. Continue?`;
       if (!confirm(msg)) return;
-      let cur; for (let i = 0; i < 200; i++) { const r = await Api.leave(f.id, erase.checked, cur); if (!r.more) break; cur = r.cursor; }
-      S.forecasts = S.forecasts.filter(x => x.id !== f.id);
-      delete S.raw[f.id];
-      S.active = S.forecasts[0]?.id || null; Local.set('tab', S.active || '');
-      closePanel(); renderTabs(); if (S.active) await refresh(S.active, true); render(); toast('You\u2019ve stopped sharing');
+      await leaveForecast(f, erase.checked());
+      closePanel(); await afterRemoval('You\u2019ve stopped sharing');
     });
     return h('section', { class: 'sheet' },
       h('h3', { text: `Shared with ${f.ownerName}` }),
-      ...cycleSettings(f),
-      h('div', { style: 'margin-top:20px;display:grid;gap:10px' },
-        h('label', { class: 'row small' }, erase, 'Also erase everything I shared'),
-        leave));
+      ...cycleSettings(f), unlockLinkSection(f),
+      h('div', { style: 'margin-top:20px;display:grid;gap:10px' }, erase, leave));
   }
 
+  async function destroyForecast(f) {
+    let cur;
+    for (let i = 0; i < 500; i++) { const r = await Api.destroy(f.id, cur); if (!r.more) break; cur = r.cursor; }
+  }
+  async function leaveForecast(f, erase) {
+    let cur;
+    for (let i = 0; i < 500; i++) { const r = await Api.leave(f.id, erase, cur); if (!r.more) break; cur = r.cursor; }
+  }
+  async function afterRemoval(msg) {
+    S.forecasts = S.forecasts.filter(x => x.id !== S.active);
+    delete S.raw[S.active];
+    S.active = S.forecasts[0]?.id || null; Local.set('tab', S.active || '');
+    renderTabs();
+    if (S.active) await refresh(S.active, true);
+    await render(); toast(msg);
+  }
+
+  // ── account ──────────────────────────────────────────────────────────
   function accountSettings() {
     const gbox = h('div');
-    const sec = h('section', { class: 'sheet' },
-      h('h3', { text: `Signed in as ${S.me.person.displayName}` }));
-    if (S.me.hasGoogle) {
-      sec.append(h('p', { class: 'small muted', text: 'Google is linked, so you can sign in on any device.' }));
-    } else {
-      sec.append(h('p', { class: 'small muted', text: 'Link Google to sign in on another device. Without it, this device is your only way in.' }), gbox);
+    const sec = h('section', { class: 'sheet' }, h('h3', { text: `Signed in as ${S.me.displayName}` }));
+
+    if (S.me.hasGoogle) sec.append(h('p', { class: 'small muted', text: 'Google is linked for signing in. Only an unreadable fingerprint of it is stored.' }));
+    else {
+      sec.append(h('p', { class: 'small muted', text: 'Optional: link Google so you can sign in without typing your recovery key. A new device will still ask for the key once.' }), gbox);
       renderGoogle(gbox, 'link');
     }
-    sec.append(h('button', { class: 'btn quiet', type: 'button', onclick: async () => {
-      try { await Api.signOut(); } catch {}
-      Local.set('session', ''); Local.set('tab', '');
-      location.reload();
-    } }, 'Sign out'));
+
+    const rekey = h('button', { class: 'btn quiet', type: 'button' }, 'Make a new recovery key');
+    rekey.onclick = () => busy(rekey, async () => {
+      if (!confirm('Your current recovery key will stop working. Continue?')) return;
+      const id = await Vault.rewrapIdentity(S.dataKey);
+      const r = await Api.rekey({ loginSecret: id.loginSecret, wrappedDataKey: id.wrappedDataKey });
+      S.me = r.person;
+      closePanel();
+      gateShowRecovery(id.recoveryText, () => { $('gate').hidden = true; $('app').hidden = false; }, 'Your new recovery key. The old one no longer works.');
+    });
+
+    const exp = h('button', { class: 'btn quiet', type: 'button' }, 'Download my data');
+    exp.onclick = () => busy(exp, exportData);
+
+    const delAcct = h('button', { class: 'btn danger', type: 'button' }, 'Delete my account');
+    delAcct.onclick = () => busy(delAcct, deleteAccount);
+
+    sec.append(
+      h('div', { style: 'display:grid;gap:10px;margin-top:8px' }, rekey, exp,
+        h('button', { class: 'btn quiet', type: 'button', onclick: () => {
+          if (confirm('Signing out also removes your key from this device. You\u2019ll need your recovery key to sign back in here. Continue?')) signOut();
+        } }, 'Sign out'),
+        delAcct));
     return sec;
+  }
+
+  async function signOut() {
+    try { await Api.signOut(); } catch {}
+    if (S.me) await Vault.forgetDataKey(S.me.id).catch(() => {});
+    Local.set('session', ''); Local.set('tab', '');
+    cleanUrl();
+    location.reload();
+  }
+
+  async function exportData() {
+    const out = { exportedAt: new Date().toISOString(), nickname: S.me.displayName, forecasts: [] };
+    for (const f of S.forecasts) {
+      if (f.locked) { out.forecasts.push({ name: tabName(f), locked: true }); continue; }
+      await refresh(f.id, true);
+      const { entries } = await plainEntries(f);
+      out.forecasts.push({
+        name: tabName(f), role: f.role,
+        cycleLength: f.cycleLength, periodLength: f.periodLength,
+        entries: entries.map(e => ({ date: e.date, kind: e.kind, visibility: e.visibility, author: authorName(f, e),
+          ...(e.fields && Object.keys(e.fields).length ? { fields: e.fields } : {}), ...(e.body ? { body: e.body } : {}) })),
+      });
+    }
+    download(`forecast-${Dates.today()}.json`, JSON.stringify(out, null, 2));
+  }
+
+  async function deleteAccount() {
+    const owned = S.forecasts.filter(f => f.role === 'owner').length;
+    const joined = S.forecasts.length - owned;
+    if (!confirm(`This deletes your account${owned ? `, ${owned} forecast${owned > 1 ? 's' : ''} you created (for everyone on them)` : ''}${joined ? `, and everything you shared on ${joined} forecast${joined > 1 ? 's' : ''} you joined` : ''}. It can\u2019t be undone. Continue?`)) return;
+    if (prompt(`Type your nickname, ${S.me.displayName}, to confirm.`) !== S.me.displayName) return toast('Nickname didn\u2019t match. Nothing was deleted.');
+    toast('Deleting\u2026');
+    for (const f of S.forecasts) f.role === 'owner' ? await destroyForecast(f) : await leaveForecast(f, true);
+    await Api.deleteAccount();
+    await Vault.forgetDataKey(S.me.id).catch(() => {});
+    Local.set('session', ''); Local.set('tab', '');
+    location.reload();
   }
 
   // ── keep current ─────────────────────────────────────────────────────
   async function tick() {
-    if (document.hidden || !S.active || !$('overlay').hidden) return;
-    // Never re-render under someone who is typing or has a form open.
+    if (document.hidden || !S.active || !$('overlay').hidden || $('app').hidden) return;
     const typing = [...document.querySelectorAll('#main textarea')].some(t => t.value.trim())
       || document.querySelector('#main .seg button[aria-pressed="true"], #main .chip[aria-pressed="true"]')
       || /INPUT|TEXTAREA/.test(document.activeElement?.tagName || '');
@@ -888,7 +1184,7 @@
     const before = S.raw[S.active]?.size || 0;
     try {
       await refresh(S.active, false);
-      if ((S.raw[S.active]?.size || 0) !== before) render();
+      if ((S.raw[S.active]?.size || 0) !== before) await render();
     } catch {}
   }
   setInterval(tick, 60000);
