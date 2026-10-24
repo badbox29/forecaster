@@ -140,7 +140,7 @@
       ...gateHeader('Forecast', 'A shared cycle forecast for the people you choose.'),
       gbox,
       h('p', { class: 'gate-or', text: 'or' }),
-      h('button', { class: 'btn quiet', type: 'button', onclick: gateSignup }, 'Create an account with a sign-up code'),
+      h('button', { class: 'btn quiet', type: 'button', onclick: () => gateSignup() }, 'Create an account with a sign-up code'),
       h('button', { class: 'btn quiet', type: 'button', onclick: gatePasteInvite }, 'I have an invite link'),
       h('button', { class: 'linky', type: 'button',
         onclick: () => { Local.set('worker', ''); location.reload(); } }, 'Use a different sync address'));
@@ -148,20 +148,36 @@
     renderGoogle(gbox, 'signin');
   }
 
-  function gateSignup() {
-    const name = h('input', { type: 'text', placeholder: 'Chris', autocomplete: 'given-name', maxlength: 60 });
+  // `google` is an ID token from a Google sign-in that matched no account.
+  // Rather than dead-ending, carry it into sign-up and link it as soon as
+  // the account exists. Google tokens last about an hour, which is plenty.
+  function gateSignup(google = null) {
+    let suggested = '';
+    if (google) {
+      try { suggested = JSON.parse(atob(google.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).given_name || ''; } catch {}
+    }
+    const name = h('input', { type: 'text', placeholder: 'Chris', autocomplete: 'given-name', maxlength: 60, value: suggested });
     const code = h('input', { type: 'text', placeholder: 'Sign-up code', autocomplete: 'off', spellcheck: 'false' });
     const go = h('button', { class: 'btn', type: 'button' }, 'Create account');
     go.onclick = () => busy(go, async () => {
       if (!name.value.trim()) return toast('Enter your name.');
       const r = await Api.signup(name.value.trim(), code.value.trim());
-      await afterSession(r.sessionId);
+      Local.set('session', r.sessionId);
+      Api.setSession(r.sessionId);
+      if (google) {
+        try { await Api.googleLink(google); }
+        catch { toast('Account created. Link Google from Settings to finish.'); }
+      }
+      await enterApp();
     });
     showGate(h('div', { class: 'gate-card sheet' },
-      ...gateHeader('Create an account', 'The sign-up code is the SIGNUP_TOKEN set on your worker. People you invite never need it.'),
+      ...gateHeader('Create an account', google
+        ? 'That Google account isn\u2019t set up yet. Enter your sign-up code and it will be linked to your new account.'
+        : 'The sign-up code is the SIGNUP_TOKEN set on your worker. People you invite never need it.'),
       h('label', { class: 'field-group' }, h('span', { class: 'field-name', text: 'Your name' }), name),
       h('label', { class: 'field-group' }, h('span', { class: 'field-name', text: 'Sign-up code' }), code),
       go,
+      h('p', { class: 'small muted', text: 'Invited by someone? Use their invite link instead. You don\u2019t need a code.' }),
       h('button', { class: 'linky', type: 'button', onclick: gateSignIn }, 'Back')));
   }
 
@@ -260,8 +276,13 @@
             toast('Google linked. You can sign in on any device now.');
             closePanel();
           } else {
-            const r = await Api.google(credential);
-            await afterSession(r.sessionId);
+            try {
+              const r = await Api.google(credential);
+              await afterSession(r.sessionId);
+            } catch (e) {
+              if (e.status === 404) return gateSignup(credential);
+              throw e;
+            }
           }
         } catch (e) { toast(e.message); }
       },
