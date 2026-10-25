@@ -130,7 +130,8 @@ main { max-width: 680px; margin: 0 auto; padding: 20px 16px 80px; display: grid;
 .dial { width: 100%; aspect-ratio: 1; }
 .dial text { font-family: var(--disp); fill: var(--ink); }
 .hero-text > * + * { margin-top: 8px; }
-.front { font-family: var(--disp); font-size: 15px; color: var(--ink-2); }
+.phase-note { color: var(--ink-2); max-width: 46ch; }
+.phase-note strong { color: var(--ink); font-weight: 600; }
 .phase-name { font-size: 30px; }
 .next svg { width: 14px; height: 14px; color: var(--warm); }
 .legend { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 12px; font-size: 12px; color: var(--ink-2); margin-top: 6px; }
@@ -139,6 +140,7 @@ main { max-width: 680px; margin: 0 auto; padding: 20px 16px 80px; display: grid;
 @media (max-width: 520px) {
   .hero { grid-template-columns: 1fr; justify-items: center; text-align: center; }
   .dial { max-width: 240px; }
+  .phase-note { margin-inline: auto; }
 }
 
 /* ── Gauges ────────────────────────────────────────────────── */
@@ -154,8 +156,22 @@ main { max-width: 680px; margin: 0 auto; padding: 20px 16px 80px; display: grid;
   display: inline-block; border: 1px dashed var(--rule); border-radius: 999px; padding: 0 8px;
 }
 .gauge.est { background: transparent; border: 1px dashed var(--rule); }
+.trend { font-size: 13px; font-weight: 600; display: flex; gap: 4px; justify-content: center; align-items: baseline; margin-top: 2px; }
+.trend span[aria-hidden] { font-size: 15px; }
+.trend.up { color: var(--calm); }
+.trend.down { color: var(--warm); }
+.trend.flat { color: var(--ink-3); }
+.trend.side { color: var(--cold); }
+.sr-hint { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .soc-icon { height: 62px; display: grid; place-items: center; font-size: 30px; }
-.gauge.est .soc-icon { color: var(--ink-2); }
+.gauge.est .trend { font-size: 13px; font-weight: 600; display: flex; gap: 4px; justify-content: center; align-items: baseline; margin-top: 2px; }
+.trend span[aria-hidden] { font-size: 15px; }
+.trend.up { color: var(--calm); }
+.trend.down { color: var(--warm); }
+.trend.flat { color: var(--ink-3); }
+.trend.side { color: var(--cold); }
+.sr-hint { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.soc-icon { color: var(--ink-2); }
 .v-good, .v-green, .v-out  { color: var(--calm); }
 .v-okay, .v-yellow, .v-either { color: var(--sun); }
 .v-rough, .v-red  { color: var(--warm); }
