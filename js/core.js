@@ -201,13 +201,47 @@ function readingsFor(entries, date, subjectId) {
       const sa = a.authorId === subjectId ? 1 : 0, sb = b.authorId === subjectId ? 1 : 0;
       return sa - sb || a.createdAt - b.createdAt;
     });
+  const count = {};
   for (const r of rs) {
     for (const f of ['mood', 'energy', 'desire', 'social']) {
-      if (r.fields?.[f]) out[f] = { value: r.fields[f], by: r.authorRole };
+      if (!r.fields?.[f]) continue;
+      // Count updates from whoever's value ends up shown.
+      count[f] = out[f]?.by === r.authorRole ? (count[f] || 1) + 1 : 1;
+      out[f] = { value: r.fields[f], by: r.authorRole, at: r.createdAt, updates: count[f] };
     }
     if (r.fields?.symptoms?.length) {
       out.symptoms = [...new Set([...(out.symptoms || []), ...r.fields.symptoms])];
     }
+  }
+  return out;
+}
+
+// ── One value per measure per day ──────────────────────────────────────────
+// Several readings in a day are updates, not extra days. History (Patterns
+// and "previous" projections) uses one value per measure per day: the
+// average of HER readings that day, or of his if she logged none, so a
+// day with five check-ins weighs the same as a day with one.
+const DAY_LEVELS = { mood: ['rough', 'okay', 'good'], energy: ['red', 'yellow', 'green'], desire: ['red', 'yellow', 'green'], social: ['home', 'either', 'out'] };
+function dailyValues(entries) {
+  const days = new Map();
+  for (const e of entries) {
+    if (e.kind !== 'reading') continue;
+    const d = days.get(e.date) || { her: {}, his: {} };
+    const side = e.authorRole === 'subject' ? d.her : d.his;
+    for (const f in DAY_LEVELS) {
+      const i = e.fields?.[f] ? DAY_LEVELS[f].indexOf(e.fields[f]) : -1;
+      if (i >= 0) (side[f] ||= []).push(i);
+    }
+    days.set(e.date, d);
+  }
+  const out = [];
+  for (const [date, d] of days) {
+    const fields = {};
+    for (const f in DAY_LEVELS) {
+      const vals = d.her[f] || d.his[f];
+      if (vals) fields[f] = DAY_LEVELS[f][Math.round(vals.reduce((a, b) => a + b, 0) / vals.length)];
+    }
+    out.push({ kind: 'reading', date, fields, createdAt: Dates.toUTC(date), authorRole: d.her.mood || d.her.energy || d.her.social || d.her.desire ? 'subject' : 'owner' });
   }
   return out;
 }
@@ -278,8 +312,7 @@ function estimateReadings(entries, starts, meta, subjectId, on = Dates.today()) 
   const hist = { mood: [], energy: [], desire: [], social: [] };
   const cyclesSeen = new Set();
   if (cycle.phase !== 'late') {
-    for (const e of entries) {
-      if (e.kind !== 'reading') continue;
+    for (const e of dailyValues(entries)) {
       const w = windows.find(([a, b]) => e.date >= a && e.date < b);
       if (!w) continue;
       const pos = early ? Dates.diff(w[0], e.date) + 1 : Dates.diff(e.date, w[1]);
@@ -344,4 +377,4 @@ function trendReadings(entries, starts, meta, subjectId, on = Dates.today()) {
   return out;
 }
 
-if (typeof module !== 'undefined') module.exports = { Dates, Cycle, resolveEntries, readingsFor, Vocab, estimateReadings, trendReadings, cycleGaps, nextWindow };
+if (typeof module !== 'undefined') module.exports = { Dates, Cycle, resolveEntries, readingsFor, Vocab, estimateReadings, trendReadings, cycleGaps, nextWindow, dailyValues };

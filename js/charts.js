@@ -152,7 +152,8 @@ const Charts = (() => {
   /** One small chart per measure, plus a one-line comparison. */
   function pattern({ entries, starts, length, period, day, next, fields, width, table }) {
     setWidth(width);
-    const pts = placeReadings(entries, starts, length, period, next);
+    // One value per measure per day, so busy logging days don't outweigh quiet ones.
+    const pts = placeReadings(dailyValues(entries), starts, length, period, next);
     const out = [];
     for (const f of fields) {
       const h = 98, top = 8, bottom = 74;

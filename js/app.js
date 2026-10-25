@@ -630,8 +630,9 @@
     out.push(deck('ref', [hormonePanel(cycle, f, false), patternPanel(cycle, f, entries, partner, false, herName)]));
 
     const other = f.subjectId ? f.subjectName : null;
-    out.push(composer(sealed ? 'Make your call' : `Log ${herName}\u2019s readings`, readingForm({
-      showDesire: partner, peri: !!f.context?.perimenopause, otherName: other, defaultVis: 'shared',
+    const myToday = myLatestToday(allEntries, 'owner');
+    out.push(composer(sealed ? 'Make your call' : Object.keys(myToday).length ? 'Update your read' : `Log ${herName}\u2019s readings`, readingForm({
+      showDesire: partner, peri: !!f.context?.perimenopause, otherName: other, defaultVis: 'shared', prefill: myToday,
       onSave: async (fields, body, vis, date) => {
         // A call is blind if her report for that date wasn't visible yet.
         const herVisible = allEntries.some(e => e.kind === 'reading' && e.authorRole === 'subject' && e.date === date);
@@ -644,6 +645,15 @@
       onSave: (body, vis, date) => writeEntry(f, { kind: 'note', date, body }, vis) })));
     out.push(composer('Log a period start', periodForm(d => writeEntry(f, { kind: 'period', date: d }, 'shared'))));
     out.push(timeline(f, entries));
+    return out;
+  }
+
+  /** This person's latest value per measure today, from their own readings. */
+  function myLatestToday(entries, role) {
+    const out = {};
+    entries.filter(e => e.kind === 'reading' && e.authorRole === role && e.authorId === S.me.id && e.date === Dates.today())
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .forEach(e => { for (const k of ['mood', 'energy', 'desire', 'social']) if (e.fields?.[k]) out[k] = e.fields[k]; });
     return out;
   }
 
@@ -788,10 +798,10 @@
           modelPanel(f, entries, { you: true, sealed: false, herName: S.me.displayName, partner: !!f.asksDesire }),
         ], { rotate: true }); })(),
       deck('ref', [hormonePanel(cycle, f, true), patternPanel(cycle, f, entries, f.asksDesire, true, 'You')]),
-      composer('Today\u2019s check-in', readingForm({
-        showDesire: f.asksDesire, peri: !!f.context?.perimenopause, otherName: f.ownerName, defaultVis: 'shared',
+      (() => { const mine = myLatestToday(entries, 'subject'); return composer(Object.keys(mine).length ? 'Update today\u2019s check-in' : 'Today\u2019s check-in', readingForm({
+        showDesire: f.asksDesire, peri: !!f.context?.perimenopause, prefill: mine, otherName: f.ownerName, defaultVis: 'shared',
         onSave: (fields, body, vis, date) => writeEntry(f, { kind: 'reading', date, fields, body }, vis),
-      }), true),
+      }), true); })(),
       composer('Add a note', noteForm({ otherName: f.ownerName, defaultVis: 'private',
         onSave: (body, vis, date) => writeEntry(f, { kind: 'note', date, body }, vis) })),
       composer('My period started', periodForm(d => writeEntry(f, { kind: 'period', date: d }, 'shared'))),
@@ -968,7 +978,7 @@
     const whose = you ? 'Yours' : 'Hers';
     const compare = c => {
       if (!c.count) return 'No readings yet';
-      const n = `${c.count} reading${c.count > 1 ? 's' : ''}${c.cycles > 1 ? `, ${c.cycles} cycles` : ''}`;
+      const n = `${c.count} day${c.count > 1 ? 's' : ''}${c.cycles > 1 ? `, ${c.cycles} cycles` : ''}`;
       if (!c.verdict) return n;
       const parts = [['before', 'before ovulation'], ['after', 'after ovulation']]
         .filter(([k]) => c.verdict[k] != null && Math.abs(c.verdict[k]) >= 0.35)
@@ -989,7 +999,7 @@
           h('div', { html: c.svg }))),
         ...extra,
         h('p', { class: 'small muted', text: total
-          ? 'Each dot is one reading, placed at the same point in the cycle it came from. The solid line is the average. Typical is the same general pattern the meters project from.'
+          ? 'Each dot is one day (several check-ins in a day are averaged), placed at the same point in the cycle it came from. The solid line is the average. Typical is the same general pattern the meters project from.'
           : `${you ? 'Your' : 'Her'} line appears here as readings are logged. Typical is the general pattern the meters project from.` }),
       ] : [h('p', { class: 'muted', text: 'Log a period start to see patterns across the cycle.' })],
     };
@@ -1111,7 +1121,13 @@
     const m = est.meters;
     const note = r => {
       if (!r) return null;
-      if (r.source === 'logged') return herTag ? (r.by === 'subject' ? 'Logged by her' : 'Your read') : 'Logged';
+      if (r.source === 'logged') {
+        const time = r.at ? new Date(r.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
+        const upd = r.updates > 1;
+        if (!herTag) return `${upd ? 'Updated' : 'Logged'} ${time}`.trim();
+        if (r.by === 'subject') return `${upd ? 'Updated' : 'Logged'} by her, ${time}`;
+        return `${upd ? 'Your update' : 'Your read'}, ${time}`;
+      }
       if (r.source === 'previous') return `Previous ${r.cycles > 1 ? `${r.cycles} cycles` : 'cycle'}`;
       return 'Projected';
     };
@@ -1192,8 +1208,14 @@
     return h('div', { class: 'field-group' }, h('span', { class: 'field-name', text: label }), control);
   }
 
-  function readingForm({ showDesire, otherName, defaultVis, onSave, peri = false }) {
+  // `prefill` holds today's current values from this same person, so an
+  // update is one tap: change what shifted and save. Later readings in a
+  // day are updates; nothing earlier is overwritten.
+  function readingForm({ showDesire, otherName, defaultVis, onSave, peri = false, prefill = {} }) {
     const mood = seg(Vocab.mood), energy = seg(Vocab.energy), desire = seg(Vocab.desire), social = seg(Vocab.social);
+    const segs = { mood, energy, desire, social };
+    const applyPrefill = () => { for (const k in segs) segs[k].setValue(prefill[k] || null); };
+    applyPrefill();
     const picked = new Set();
     const symptomList = peri ? [...Vocab.symptoms, ...Vocab.periSymptoms] : Vocab.symptoms;
     const chips = h('div', { class: 'chips' }, symptomList.map(([id, label]) => h('button', {
@@ -1205,8 +1227,14 @@
     }, label)));
     const note = h('textarea', { placeholder: 'Anything else worth noting', maxlength: 2000 });
     const date = dateInput();
+    // Prefilled values are today's; switching to another date starts blank.
+    date.addEventListener('change', () => {
+      if (date.value === Dates.today()) applyPrefill();
+      else for (const k in segs) segs[k].setValue(null);
+    });
     const vis = visControl(otherName, defaultVis);
-    const go = h('button', { class: 'btn', type: 'button' }, 'Save readings');
+    const updating = Object.keys(prefill).length > 0;
+    const go = h('button', { class: 'btn', type: 'button' }, updating ? 'Save update' : 'Save readings');
     go.onclick = () => busy(go, async () => {
       const fields = {};
       if (mood.getValue()) fields.mood = mood.getValue();
@@ -1215,17 +1243,25 @@
       if (social.getValue()) fields.social = social.getValue();
       if (picked.size) fields.symptoms = [...picked];
       if (!Object.keys(fields).length && !note.value.trim()) return toast('Pick at least one reading.');
+      const sameAsBefore = (date.value || Dates.today()) === Dates.today() && updating
+        && ['mood', 'energy', 'desire', 'social'].every(k => (fields[k] || null) === (prefill[k] || null))
+        && !picked.size && !note.value.trim();
+      if (sameAsBefore) return toast('Nothing changed since the last update.');
       const msg = await onSave(fields, note.value.trim() || null, vis.getValue(), date.value || Dates.today());
       [mood, energy, desire, social].forEach(s => s.setValue(null));
       picked.clear(); chips.querySelectorAll('.chip').forEach(c => c.setAttribute('aria-pressed', 'false'));
       note.value = '';
       toast(typeof msg === 'string' ? msg : 'Readings saved');
     });
-    return h('div', { class: 'composer-body' },
+    return h('div', { class: 'composer-body', oninput: markDirty, onclick: markDirty },
+      updating ? h('p', { class: 'small muted', text: 'Showing your latest values for today. Change what shifted and save; earlier readings stay in the log.' }) : null,
       group('Mood', mood), group('Energy', energy), showDesire ? group('Desire', desire) : null,
       group('Social battery', social), group('Symptoms', chips), note,
       h('div', { class: 'row' }, date, vis), go);
   }
+
+  // A form someone has touched holds off background refreshes.
+  function markDirty(e) { e.currentTarget.dataset.dirty = '1'; }
 
   function noteForm({ otherName, defaultVis, onSave }) {
     const body = h('textarea', { placeholder: 'Write a note', maxlength: 6000 });
@@ -1258,6 +1294,17 @@
   function timeline(f, entries) {
     const me = S.me.id;
     const starts = entries.filter(e => e.kind === 'period').map(e => e.date);
+    // What each person had reported earlier the same day, so a later
+    // reading can show as an update: "Mood: good → rough".
+    const prevOf = new Map(), running = new Map();
+    entries.filter(e => e.kind === 'reading').sort((a, b) => a.createdAt - b.createdAt).forEach(e => {
+      const k = `${e.date}|${e.authorId}`;
+      const so = running.get(k);
+      if (so) prevOf.set(e.id, { ...so });
+      const next = { ...(so || {}) };
+      for (const f of ['mood', 'energy', 'desire', 'social']) if (e.fields?.[f]) next[f] = e.fields[f];
+      running.set(k, next);
+    });
     const groups = new Map();
     for (const e of entries.filter(x => x.kind !== 'pref').slice(0, 120)) {
       if (!groups.has(e.date)) groups.set(e.date, []);
@@ -1266,15 +1313,17 @@
     const body = groups.size ? [...groups].map(([date, list]) => h('div', { class: 'day-group' },
       h('div', { class: 'day-head' }, h('span', { text: Dates.pretty(date) }),
         (() => { const c = Cycle.compute(starts, f, date); return c ? h('span', { class: 'small', text: `cycle day ${c.day}` }) : null; })()),
-      ...list.map(e => entryRow(f, e, me)))) : [h('p', { class: 'empty', text: 'Nothing logged yet.' })];
+      ...list.map(e => entryRow(f, e, me, prevOf.get(e.id))))) : [h('p', { class: 'empty', text: 'Nothing logged yet.' })];
     return h('section', { class: 'sheet' }, h('h2', { text: 'Log' }), ...body);
   }
 
-  function entryRow(f, e, me) {
+  function entryRow(f, e, me, prev = null) {
     const mine = e.authorId === me;
     const meta = h('div', { class: 'entry-meta' }, h('span', { text: authorName(f, e) }));
     if (e.kind === 'period') meta.append(h('span', { class: 'badge period' }, icon('drop'), 'Period started'));
     if (e.kind === 'reading' && e.authorRole === 'owner' && e.fields?.called) meta.append(h('span', { class: 'badge call', text: 'Blind call' }));
+    if (e.kind === 'reading' && prev) meta.append(h('span', { class: 'badge update', text: 'Update' }));
+    if (e.kind === 'reading' && e.createdAt) meta.append(h('span', { text: new Date(e.createdAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }));
     else meta.append(e.visibility === 'private'
       ? h('span', { class: 'badge private' }, icon('lock'), 'Only you')
       : h('span', { class: 'badge shared' }, icon('eye'), 'Shared'));
@@ -1286,8 +1335,13 @@
 
     let content = null;
     if (e.kind === 'reading') {
-      const parts = ['mood', 'energy', 'desire', 'social'].filter(k => e.fields?.[k])
-        .map(k => `${k === 'social' ? 'Social' : k[0].toUpperCase() + k.slice(1)}: ${Vocab.label(k, e.fields[k])}`);
+      const name = k => k === 'social' ? 'Social' : k[0].toUpperCase() + k.slice(1);
+      const keys = ['mood', 'energy', 'desire', 'social'].filter(k => e.fields?.[k]);
+      // On an update, show what moved; unchanged values are left out.
+      const moved = prev ? keys.filter(k => prev[k] !== e.fields[k]) : keys;
+      const parts = moved.map(k => prev?.[k]
+        ? `${name(k)}: ${Vocab.label(k, prev[k]).toLowerCase()} \u2192 ${Vocab.label(k, e.fields[k]).toLowerCase()}`
+        : `${name(k)}: ${Vocab.label(k, e.fields[k])}`);
       content = h('div', { class: 'entry-body' },
         parts.length ? h('div', { text: parts.join(', ') }) : null,
         e.fields?.symptoms?.length ? h('div', { class: 'chips', style: 'margin-top:6px' },
@@ -1609,7 +1663,7 @@
   async function tick() {
     if (document.hidden || !S.active || !$('overlay').hidden || $('app').hidden) return;
     const typing = [...document.querySelectorAll('#main textarea')].some(t => t.value.trim())
-      || document.querySelector('#main .seg button[aria-pressed="true"], #main .chip[aria-pressed="true"]')
+      || document.querySelector('#main .composer-body[data-dirty]')
       || /INPUT|TEXTAREA/.test(document.activeElement?.tagName || '');
     if (typing) return;
     const before = S.raw[S.active]?.size || 0;

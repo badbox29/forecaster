@@ -29,25 +29,51 @@ const Models = (() => {
     return !!prefs[0]?.fields?.scoreDesire;
   }
 
-  // Latest value per field, per model, per day.
+  /**
+   * Per day:
+   *   her      her CURRENT values (latest per field), for the model card
+   *   his      his values: his first read if it was a blind call, else latest
+   *   herAt    her values as they stood when he made his call, which is what
+   *            his call is scored against. If she hadn't logged yet, her
+   *            first report after the call.
+   *   shifts   fields where she updated after his call
+   */
   function byDay(entries, fields) {
     const days = new Map();
     const sorted = entries.filter(e => e.kind === 'reading').sort((a, b) => a.createdAt - b.createdAt);
     for (const e of sorted) {
-      const side = e.authorRole === 'subject' ? 'her' : 'his';
-      if (!days.has(e.date)) days.set(e.date, { her: {}, his: {}, called: null, hisAt: null, herAt: null });
-      const d = days.get(e.date);
-      for (const f of fields) if (e.fields?.[f]) d[side][f] = e.fields[f];
-      if (side === 'his') {
-        if (d.hisAt == null) d.hisAt = e.createdAt;
-        // Blind if he logged before her, or flagged as called while sealed.
-        if (e.fields?.called) d.called = true;
-      } else if (d.herAt == null) d.herAt = e.createdAt;
+      if (!days.has(e.date)) days.set(e.date, { hers: [], his: [] });
+      days.get(e.date)[e.authorRole === 'subject' ? 'hers' : 'his'].push(e);
     }
-    for (const d of days.values()) {
-      if (d.called == null) d.called = d.hisAt != null && (d.herAt == null || d.hisAt < d.herAt);
+    const out = new Map();
+    for (const [date, d] of days) {
+      const latest = list => {
+        const o = {};
+        for (const e of list) for (const f of fields) if (e.fields?.[f]) o[f] = e.fields[f];
+        return o;
+      };
+      const her = latest(d.hers);
+      const call = d.his[0] || null;
+      const herFirstAt = d.hers[0]?.createdAt ?? null;
+      const called = !!call && (!!call.fields?.called || herFirstAt == null || call.createdAt < herFirstAt);
+      const his = called ? latest([call]) : latest(d.his);
+      const herAt = {}, shifts = [];
+      if (call) {
+        for (const f of fields) {
+          const before = d.hers.filter(e => e.fields?.[f] && e.createdAt <= call.createdAt).at(-1);
+          const after = d.hers.find(e => e.fields?.[f] && e.createdAt > call.createdAt);
+          const ref = before || after;
+          if (!ref) continue;
+          herAt[f] = ref.fields[f];
+          if (called && her[f] && her[f] !== herAt[f]) {
+            const last = d.hers.filter(e => e.fields?.[f]).at(-1);
+            shifts.push({ field: f, from: herAt[f], to: her[f], at: last.createdAt });
+          }
+        }
+      }
+      out.set(date, { her, his, herAt: call ? herAt : her, called, shifts, hisAt: call?.createdAt ?? null });
     }
-    return days;
+    return out;
   }
 
   /** Agreement for one day: 1 match, 0.5 one step apart, 0 opposite ends. */
@@ -55,7 +81,7 @@ const Models = (() => {
     const per = {};
     let sum = 0, n = 0;
     for (const f of fields) {
-      const a = d.her[f], b = d.his[f];
+      const a = d.herAt[f], b = d.his[f];
       if (!a || !b) continue;
       const diff = lv(f, b) - lv(f, a);          // + means he read her higher
       const agree = diff === 0 ? 1 : Math.abs(diff) === 1 ? 0.5 : 0;
@@ -69,7 +95,7 @@ const Models = (() => {
   function summary(entries, { today, scoreDesire }) {
     const fields = ['mood', 'energy', 'social', ...(scoreDesire ? ['desire'] : [])];
     const days = byDay(entries, [...fields, 'desire']);
-    const todayDay = days.get(today) || { her: {}, his: {}, called: false };
+    const todayDay = days.get(today) || { her: {}, his: {}, herAt: {}, called: false, shifts: [] };
     const todayCmp = compareDay(todayDay, fields);
 
     const series = [];
@@ -119,6 +145,7 @@ const Models = (() => {
       her: condition('her'), his: condition('his'),
       series, s7: window(7), s30: window(30), bias, missStreak, matchStreak,
       hasHer: Object.keys(todayDay.her).length > 0, hasHis: Object.keys(todayDay.his).length > 0,
+      shifts: todayDay.shifts || [],
     };
   }
 
@@ -140,6 +167,10 @@ const Models = (() => {
         lines.push(`The models agree in part. Divergence on ${misses.join(' and ')}. The ${herModel} is authoritative; the ${hisModel} has been notified.`);
       }
       if (!s.todayCalled) lines.push(`Today\u2019s ${hisModel} reading was filed after the ${herModel} report was visible, so it doesn\u2019t count toward accuracy.`);
+      for (const sh of s.shifts) {
+        const time = new Date(sh.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+        lines.push(`Conditions changed after the ${hisModel} filed: ${NAMES[sh.field]} ${Vocab.label(sh.field, sh.from).toLowerCase()} \u2192 ${Vocab.label(sh.field, sh.to).toLowerCase()} at ${time}. The call is scored against conditions when it was made.`);
+      }
     } else if (s.hasHer && !s.hasHis) {
       lines.push(`The ${herModel} has reported. The ${hisModel} has yet to file an observation.`);
     } else if (!s.hasHer && s.hasHis) {
