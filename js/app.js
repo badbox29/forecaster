@@ -616,9 +616,9 @@
       trendReadings(entries, starts, f, f.subjectId, today), Insights.todayNote(f.context, false));
     out.push(deck([
       { title: 'Today', aside: Dates.pretty(today), body: sealed ? [sealedBanner(herName), todayBody] : todayBody },
+      modelPanel(f, entries, { you: false, sealed, herName, partner }),
       hormonePanel(cycle, f, false),
       patternPanel(cycle, f, entries, partner, false, herName),
-      modelPanel(f, entries, { you: false, sealed, herName, partner }),
     ]));
 
     const adv = Advisory.forOwner({ cycle, readings, relation: f.relation, name: herName, date: today });
@@ -661,7 +661,7 @@
   async function reveal(f, herName) {
     const { entries } = await plainEntries(f);
     const s = Models.summary(entries, { today: Dates.today(), scoreDesire: Models.desireOptIn(entries) });
-    deckIndex = 3; deckDir = 1;
+    deckIndex = 1; deckDir = 1;   // Model Guidance is the second panel
     await render();
     document.querySelector('.deck')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     const t = s.today;
@@ -785,9 +785,9 @@
         return deck([
           { title: 'Today', aside: Dates.pretty(Dates.today()),
             body: todayCard(estimateReadings(entries, st, f, S.me.id), f.asksDesire, null, 'You', trendReadings(entries, st, f, S.me.id), Insights.todayNote(f.context, true)) },
+          modelPanel(f, entries, { you: true, sealed: false, herName: S.me.displayName, partner: !!f.asksDesire }),
           hormonePanel(cycle, f, true),
           patternPanel(cycle, f, entries, f.asksDesire, true, 'You'),
-          modelPanel(f, entries, { you: true, sealed: false, herName: S.me.displayName, partner: !!f.asksDesire }),
         ]); })(),
       composer('Today\u2019s check-in', readingForm({
         showDesire: f.asksDesire, peri: !!f.context?.perimenopause, otherName: f.ownerName, defaultVis: 'shared',
