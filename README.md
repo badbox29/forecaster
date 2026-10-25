@@ -87,6 +87,11 @@ tabs, or named after each of you on family and friend tabs.
   but not scored, and blind calls are badged in the log.
 - Her report is always the authority; the score measures how well you read
   her.
+- **Scored at the time of the call.** Your call is compared with what she
+  had reported when you made it, or her first report if she hadn't logged
+  yet. If her day shifts afterward, the discussion says so ("Conditions
+  changed after the Partner Model filed: mood good → rough at 6:14 PM")
+  instead of counting it against you.
 - **Desire is left out of the comparison** unless she opts in from her own
   Settings. Her choice is stored as her own entry, which the server stamps
   with her role, so it can't be switched on for her.
@@ -115,6 +120,14 @@ second half of a cycle is much steadier than the first.
 
 - **Readings**: mood, energy, desire, social battery, symptoms and a note,
   for today or any past date. Every field is optional.
+- **Updates through the day.** Log as often as things change. After the
+  first reading of the day the form opens with the current values filled
+  in, so an update is one tap. Nothing earlier is overwritten: the meters
+  show the latest value with the time ("Updated by her, 6:14 PM"), and the
+  log shows the change ("Mood: good → rough").
+- **One value per day for history.** Patterns and projections average a
+  day's readings into one value per measure, using her readings when she
+  logged and yours otherwise, so busy days don't outweigh quiet ones.
 - **Notes**: free text for any date.
 - **Period starts**: always visible to both people, since they drive the
   forecast.
