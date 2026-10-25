@@ -315,6 +315,15 @@ textarea.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace
 .key i { display: inline-block; width: 18px; }
 .mini-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .mini-chart + .mini-chart { margin-top: 6px; }
+.ctx-box { background: var(--sheet-2); border-radius: var(--r-sm); padding: 12px 14px; display: grid; gap: 10px; }
+.ctx strong { font-weight: 600; }
+.ins-head { margin-top: 18px; font-size: 18px; }
+.ins-block { border-left: 3px solid var(--rule); padding: 2px 0 2px 12px; }
+.ins-block > * + * { margin-top: 6px; }
+.ins-block ul { margin: 6px 0 0; padding-left: 18px; }
+.ins-block li + li { margin-top: 4px; }
+.ins-block.care { border-left-color: var(--warm); }
+.callout { background: var(--cold-sk); border-radius: var(--r-sm); padding: 10px 12px; font-size: 14px; }
 .empty { text-align: center; padding: 8px 0; color: var(--ink-2); }
 
 @media (prefers-reduced-motion: no-preference) {
