@@ -199,4 +199,88 @@ function readingsFor(entries, date, subjectId) {
   return out;
 }
 
-if (typeof module !== 'undefined') module.exports = { Dates, Cycle, resolveEntries, readingsFor, Vocab };
+// ── Estimates for today's meters ───────────────────────────────────────────
+//
+// Each meter resolves in this order:
+//   logged     a reading for today exists
+//   previous   readings from her own past cycles at the same point
+//   projected  a general pattern for this phase
+//
+// "The same point" depends on the phase. The first half of a cycle varies
+// in length from cycle to cycle; the second half (ovulation to the next
+// period) is much steadier. So early days are matched by day since the
+// period started, and later days by days until the next one. That is what
+// lets a 26-day cycle and a 31-day cycle line up sensibly.
+//
+// The projected table is deliberately mild. These are broad tendencies
+// reported in the literature, individual variation is large, and the only
+// job of a projection is to be replaced by her own history.
+const TYPICAL = {
+  menstrual:    { mood: 'okay', energy: 'yellow', desire: 'yellow', social: 'home' },
+  follicular:   { mood: 'good', energy: 'green',  desire: 'yellow', social: 'out' },
+  ovulation:    { mood: 'good', energy: 'green',  desire: 'green',  social: 'out' },
+  luteal:       { mood: 'okay', energy: 'yellow', desire: 'yellow', social: 'either' },
+  premenstrual: { mood: 'okay', energy: 'yellow', desire: 'red',    social: 'home' },
+};
+const ORDINAL = { mood: ['rough', 'okay', 'good'], energy: ['red', 'yellow', 'green'], desire: ['red', 'yellow', 'green'] };
+const EARLY = new Set(['menstrual', 'follicular']);
+
+function estimateReadings(entries, starts, meta, subjectId, on = Dates.today()) {
+  const out = {};
+  const logged = readingsFor(entries, on, subjectId);
+  for (const [f, r] of Object.entries(logged)) if (f !== 'symptoms') out[f] = { ...r, source: 'logged' };
+
+  const cycle = Cycle.compute(starts, meta, on);
+  if (!cycle) return { meters: out, cycle: null, symptoms: logged.symptoms || [] };
+
+  // Past, completed cycles only: [start, nextStart)
+  const sorted = [...new Set(starts)].sort().filter(s => s < cycle.start);
+  sorted.push(cycle.start);
+  const windows = [];
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const len = Dates.diff(sorted[i], sorted[i + 1]);
+    if (len >= 18 && len <= 60) windows.push([sorted[i], sorted[i + 1]]);
+  }
+
+  const early = EARLY.has(cycle.phase);
+  const target = early ? cycle.day : cycle.daysToNext;
+  const hist = { mood: [], energy: [], desire: [], social: [] };
+  const cyclesSeen = new Set();
+  if (cycle.phase !== 'late') {
+    for (const e of entries) {
+      if (e.kind !== 'reading') continue;
+      const w = windows.find(([a, b]) => e.date >= a && e.date < b);
+      if (!w) continue;
+      const pos = early ? Dates.diff(w[0], e.date) + 1 : Dates.diff(e.date, w[1]);
+      if (Math.abs(pos - target) > 1) continue;
+      for (const f of Object.keys(hist)) {
+        if (e.fields?.[f]) { hist[f].push({ v: e.fields[f], at: e.date }); cyclesSeen.add(f + w[0]); }
+      }
+    }
+  }
+
+  const typical = TYPICAL[cycle.phase === 'late' ? 'premenstrual' : cycle.phase];
+  for (const f of ['mood', 'energy', 'desire', 'social']) {
+    if (out[f]) continue;
+    const vals = hist[f];
+    if (vals.length) {
+      let value;
+      if (ORDINAL[f]) {
+        const avg = vals.reduce((a, x) => a + ORDINAL[f].indexOf(x.v), 0) / vals.length;
+        value = ORDINAL[f][Math.round(avg)];
+      } else {
+        const count = {};
+        for (const x of vals) count[x.v] = (count[x.v] || 0) + 1;
+        const best = Math.max(...Object.values(count));
+        value = vals.filter(x => count[x.v] === best).sort((a, b) => b.at.localeCompare(a.at))[0].v;
+      }
+      const cycles = [...cyclesSeen].filter(k => k.startsWith(f)).length;
+      out[f] = { value, source: 'previous', cycles };
+    } else {
+      out[f] = { value: typical[f], source: 'projected' };
+    }
+  }
+  return { meters: out, cycle, symptoms: logged.symptoms || [] };
+}
+
+if (typeof module !== 'undefined') module.exports = { Dates, Cycle, resolveEntries, readingsFor, Vocab, estimateReadings };

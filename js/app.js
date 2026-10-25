@@ -591,7 +591,8 @@
 
     if (!f.subjectId) out.push(inviteCard(f));
     out.push(hero(cycle, herName));
-    out.push(todayCard(readings, partner, herName, f.subjectId ? 'her' : null));
+    const starts = entries.filter(e => e.kind === 'period').map(e => e.date);
+    out.push(todayCard(estimateReadings(entries, starts, f, f.subjectId, today), partner, f.subjectId ? 'her' : null, herName));
 
     const adv = Advisory.forOwner({ cycle, readings, relation: f.relation, name: herName, date: today });
     out.push(h('section', { class: 'advisory' + (/Clear|Fair/.test(adv.headline) ? ' fair' : '') },
@@ -659,7 +660,7 @@
     return [
       hero(cycle, null),
       h('section', { class: 'sheet' }, h('h2', { text: 'Your outlook' }), ...o.lines.map(l => h('p', { text: l }))),
-      todayCard(readings, f.asksDesire, 'You', null),
+      todayCard(estimateReadings(entries, entries.filter(e => e.kind === 'period').map(e => e.date), f, S.me.id), f.asksDesire, null, 'You'),
       composer('Today\u2019s check-in', readingForm({
         showDesire: f.asksDesire, otherName: f.ownerName, defaultVis: 'shared',
         onSave: (fields, body, vis, date) => writeEntry(f, { kind: 'reading', date, fields, body }, vis),
@@ -742,7 +743,7 @@
   }
 
   // ── today's gauges ───────────────────────────────────────────────────
-  function gaugeSVG(level) {   // level: 0 low, 1 mid, 2 high, null none
+  function gaugeSVG(level, estimate = false) {   // level: 0 low, 1 mid, 2 high, null none
     const seg = (a0, a1, color) => {
       const p = a => [50 + 40 * Math.cos(a), 52 - 40 * Math.sin(a)];
       const [x1, y1] = p(a0), [x2, y2] = p(a1);
@@ -752,7 +753,8 @@
     let s = seg(Math.PI, 2 * t + gap, '--warm') + seg(2 * t - gap, t + gap, '--sun') + seg(t - gap, 0, '--calm');
     if (level != null) {
       const a = Math.PI - (level * 2 + 1) * (Math.PI / 6);
-      s += `<line x1="50" y1="52" x2="${(50 + 32 * Math.cos(a)).toFixed(1)}" y2="${(52 - 32 * Math.sin(a)).toFixed(1)}" style="stroke:var(--ink)" stroke-width="3" stroke-linecap="round"/>`;
+      // An estimate gets a dashed, lighter needle; a logged reading a solid one.
+      s += `<line x1="50" y1="52" x2="${(50 + 32 * Math.cos(a)).toFixed(1)}" y2="${(52 - 32 * Math.sin(a)).toFixed(1)}" style="stroke:var(${estimate ? '--ink-2' : '--ink'})" stroke-width="3" stroke-linecap="round"${estimate ? ' stroke-dasharray="4 4"' : ''}/>`;
     }
     s += '<circle cx="50" cy="52" r="4" style="fill:var(--ink)"/>';
     return `<svg viewBox="0 0 100 58" aria-hidden="true">${s}</svg>`;
@@ -760,31 +762,44 @@
 
   const LEVEL = { rough: 0, okay: 1, good: 2, red: 0, yellow: 1, green: 2 };
 
-  function todayCard(readings, showDesire, who, herTag) {
-    const by = r => !r ? null : herTag && r.by === 'subject' ? 'from her' : herTag ? 'your read' : null;
-    const g = (label, field) => {
-      const r = readings[field];
-      return h('div', { class: 'gauge' },
-        h('span', { html: gaugeSVG(r ? LEVEL[r.value] : null) }),
-        h('div', { class: 'gauge-label', text: label }),
-        h('div', { class: 'gauge-value ' + (r ? 'v-' + r.value : 'v-none'), text: r ? Vocab.label(field, r.value) : 'No reading' }),
-        by(r) ? h('div', { class: 'gauge-by', text: by(r) }) : null);
+  // est: result of estimateReadings(). herTag is 'her' on the owner's tab
+  // once she has joined, so a logged value can say whose read it was.
+  function todayCard(est, showDesire, herTag, name) {
+    const m = est.meters;
+    const note = r => {
+      if (!r) return null;
+      if (r.source === 'logged') return herTag ? (r.by === 'subject' ? 'Logged by her' : 'Your read') : 'Logged';
+      if (r.source === 'previous') return `Previous ${r.cycles > 1 ? `${r.cycles} cycles` : 'cycle'}`;
+      return 'Projected';
     };
-    const soc = readings.social;
+    const shell = (r, visual, label, field) => h('div', { class: 'gauge' + (r && r.source !== 'logged' ? ' est' : '') },
+      visual,
+      h('div', { class: 'gauge-label', text: label }),
+      h('div', { class: 'gauge-value ' + (r ? 'v-' + r.value : 'v-none'), text: r ? Vocab.label(field, r.value) : 'No reading' }),
+      r ? h('div', { class: 'gauge-by ' + r.source, text: note(r) }) : null);
+    const g = (label, field) => {
+      const r = m[field];
+      return shell(r, h('span', { html: gaugeSVG(r ? LEVEL[r.value] : null, r && r.source !== 'logged') }), label, field);
+    };
+    const soc = m.social;
     const items = [g('Mood', 'mood'), g('Energy', 'energy')];
     if (showDesire) items.push(g('Desire', 'desire'));
-    items.push(h('div', { class: 'gauge' },
-      h('div', { style: 'height:62px;display:grid;place-items:center;font-size:30px', 'aria-hidden': 'true',
-        text: soc ? { home: '\u2302', either: '\u21C4', out: '\u2197' }[soc.value] : '\u2013' }),
-      h('div', { class: 'gauge-label', text: 'Social' }),
-      h('div', { class: 'gauge-value ' + (soc ? 'v-' + soc.value : 'v-none'), text: soc ? Vocab.label('social', soc.value) : 'No reading' })));
+    items.push(shell(soc, h('div', { class: 'soc-icon', 'aria-hidden': 'true',
+      text: soc ? { home: '\u2302', either: '\u21C4', out: '\u2197' }[soc.value] : '\u2013' }), 'Social', 'social'));
+
+    const sources = new Set(Object.values(m).map(r => r.source));
+    let foot = null;
+    if (!est.cycle) foot = 'Log a period start and the meters will show projections for each day.';
+    else if (sources.has('projected')) foot = `Projected values are broad tendencies for this phase, and people vary a lot. As ${name === 'You' ? 'you log' : `${name} logs`} readings, each meter switches to ${name === 'You' ? 'your' : 'her'} own previous cycles.`;
+    else if (sources.has('previous')) foot = `Previous values come from the same point in ${name === 'You' ? 'your' : 'her'} earlier cycles.`;
 
     return h('section', { class: 'sheet' },
       h('div', { class: 'sheet-head' }, h('h2', { text: 'Today' }), h('span', { class: 'small muted', text: Dates.pretty(Dates.today()) })),
       h('div', { class: 'gauges' }, items),
-      readings.symptoms?.length
-        ? h('div', { class: 'chips' }, readings.symptoms.map(s => h('span', { class: 'chip static', text: Vocab.label('symptoms', s) })))
-        : null);
+      est.symptoms.length
+        ? h('div', { class: 'chips' }, est.symptoms.map(s => h('span', { class: 'chip static', text: Vocab.label('symptoms', s) })))
+        : null,
+      foot ? h('p', { class: 'small muted', text: foot }) : null);
   }
 
   // ── forms ────────────────────────────────────────────────────────────
