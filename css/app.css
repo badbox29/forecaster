@@ -299,7 +299,17 @@ textarea.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace
 .deck-arrow:hover { background: var(--sheet-2); }
 .deck-body > * + * { margin-top: 12px; }
 .panel-body > * + * { margin-top: 12px; }
+.deck-foot { display: flex; justify-content: center; align-items: center; gap: 12px; }
 .deck-dots { display: flex; justify-content: center; gap: 8px; }
+.deck-play {
+  width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--rule); background: var(--sheet);
+  color: var(--ink-2); font-size: 10px; letter-spacing: -2px; cursor: pointer; display: grid; place-items: center; padding: 0;
+}
+.deck-play:hover { color: var(--cold); }
+.deck { position: relative; overflow: hidden; }
+.deck-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; }
+.deck-progress i { display: block; height: 100%; width: 0; background: var(--cold); opacity: .7; transition: width .2s linear; }
+.deck:not(.rotating) .deck-progress { display: none; }
 .deck-dots button { width: 8px; height: 8px; padding: 0; border-radius: 50%; border: 0; background: var(--rule); cursor: pointer; }
 .deck-dots button[aria-selected="true"] { background: var(--cold); width: 22px; border-radius: 4px; }
 @media (prefers-reduced-motion: no-preference) {
