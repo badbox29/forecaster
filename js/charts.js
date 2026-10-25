@@ -112,9 +112,9 @@ const Charts = (() => {
 
   // The typical curve is the projected table from core.js, smoothed over
   // five days and wrapped around the cycle, so it agrees with the meters.
-  function typicalCurve(field, len, period) {
+  function typicalCurve(field, len, period, table = TYPICAL) {
     const raw = [];
-    for (let d = 1; d <= len; d++) raw.push(FIELDS[field].levels.indexOf(TYPICAL[Cycle.phaseOf(d, len, period)][field]));
+    for (let d = 1; d <= len; d++) raw.push(FIELDS[field].levels.indexOf(table[Cycle.phaseOf(d, len, period)][field]));
     return raw.map((_, i) => {
       let sum = 0;
       for (let k = -2; k <= 2; k++) sum += raw[(i + k + len) % len];
@@ -150,14 +150,14 @@ const Charts = (() => {
   }
 
   /** One small chart per measure, plus a one-line comparison. */
-  function pattern({ entries, starts, length, period, day, next, fields, width }) {
+  function pattern({ entries, starts, length, period, day, next, fields, width, table }) {
     setWidth(width);
     const pts = placeReadings(entries, starts, length, period, next);
     const out = [];
     for (const f of fields) {
       const h = 98, top = 8, bottom = 74;
       const y = v => bottom - (v / 2) * (bottom - top);
-      const typ = typicalCurve(f, length, period);
+      const typ = typicalCurve(f, length, period, table || TYPICAL);
       const typPath = path(typ.map((v, i) => [fx(i + 1, length), y(v)]));
 
       // Her line: average per placed day.

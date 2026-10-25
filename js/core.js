@@ -290,7 +290,8 @@ function estimateReadings(entries, starts, meta, subjectId, on = Dates.today()) 
     }
   }
 
-  const typical = TYPICAL[cycle.phase === 'late' ? 'premenstrual' : cycle.phase];
+  // A life stage can swap in its own table (see insights.js).
+  const typical = (meta.typical || TYPICAL)[cycle.phase === 'late' ? 'premenstrual' : cycle.phase];
   for (const f of ['mood', 'energy', 'desire', 'social']) {
     if (out[f]) continue;
     const vals = hist[f];

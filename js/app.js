@@ -90,7 +90,9 @@
     if (k && f.sharedEnc) { try { shared = { ...shared, ...await Vault.open(k.key, f.sharedEnc, `shared:${f.id}`) }; } catch {} }
     let own = { label: 'Forecast', relation: 'partner' };
     if (f.role === 'owner' && f.ownerEnc) { try { own = { ...own, ...await Vault.open(S.dataKey, f.ownerEnc, `owner:${f.id}`) }; } catch {} }
-    return Object.assign(f, { key: k, locked: !k, ...shared, ...(f.role === 'owner' ? own : {}) });
+    Object.assign(f, { key: k, locked: !k, ...shared, ...(f.role === 'owner' ? own : {}) });
+    f.typical = Insights.projectionTable(f.context);   // null = the textbook table
+    return f;
   }
 
   async function decryptEntry(f, e) {
@@ -598,10 +600,9 @@
     const starts = entries.filter(e => e.kind === 'period').map(e => e.date);
     out.push(deck([
       { title: 'Today', aside: Dates.pretty(today), body: todayCard(estimateReadings(entries, starts, f, f.subjectId, today), partner, f.subjectId ? 'her' : null, herName,
-        trendReadings(entries, starts, f, f.subjectId, today)) },
+        trendReadings(entries, starts, f, f.subjectId, today), Insights.todayNote(f.context, false)) },
       hormonePanel(cycle, f, false),
       patternPanel(cycle, f, entries, partner, false, herName),
-      insightsPanel(f, cycle, entries, false, herName),
     ]));
 
     const adv = Advisory.forOwner({ cycle, readings, relation: f.relation, name: herName, date: today });
@@ -673,10 +674,9 @@
       (() => { const st = entries.filter(e => e.kind === 'period').map(e => e.date);
         return deck([
           { title: 'Today', aside: Dates.pretty(Dates.today()),
-            body: todayCard(estimateReadings(entries, st, f, S.me.id), f.asksDesire, null, 'You', trendReadings(entries, st, f, S.me.id)) },
+            body: todayCard(estimateReadings(entries, st, f, S.me.id), f.asksDesire, null, 'You', trendReadings(entries, st, f, S.me.id), Insights.todayNote(f.context, true)) },
           hormonePanel(cycle, f, true),
           patternPanel(cycle, f, entries, f.asksDesire, true, 'You'),
-          insightsPanel(f, cycle, entries, true, 'You'),
         ]); })(),
       composer('Today\u2019s check-in', readingForm({
         showDesire: f.asksDesire, peri: !!f.context?.perimenopause, otherName: f.ownerName, defaultVis: 'shared',
@@ -749,6 +749,9 @@
         h('div', { class: 'keys' }, key('--cold', 'Estrogen'), key('--calm', 'Progesterone'), key('--sun', 'LH', true)),
         note && !f.context?.hormonalBC ? h('p', { text: note }) : null,
         Insights.hormoneCaveat(f.context || {}, you) ? h('p', { class: 'callout', text: Insights.hormoneCaveat(f.context || {}, you) }) : null,
+        ...Insights.hormoneSections(f.context || {}, { you, entries: [], starts: [], today: Dates.today() }).map(sec => h('details', { class: 'more' + (sec.tone === 'care' ? ' care' : '') },
+          h('summary', { text: sec.title }),
+          h('ul', {}, sec.list.map(t => h('li', { text: t }))))),
         h('p', { class: 'small muted', text: `Drawn for ${you ? 'your' : 'her'} ${length}-day cycle, with ovulation about 14 days before the next period. Shapes only: each hormone is scaled to its own peak, and real levels vary from person to person and cycle to cycle.` }),
       ],
     };
@@ -758,7 +761,14 @@
     const length = cycle?.length || f.cycleLength || 28, period = cycle?.period || f.periodLength || 5;
     const starts = entries.filter(e => e.kind === 'period').map(e => e.date);
     const fields = ['mood', 'energy', ...(showDesire ? ['desire'] : []), 'social'];
-    const charts = cycle ? Charts.pattern({ entries, starts, length, period, day: cycle.late ? null : cycle.day, next: cycle.next, fields, width: chartWidth() }) : [];
+    const charts = cycle ? Charts.pattern({ entries, starts, length, period, day: cycle.late ? null : cycle.day, next: cycle.next, fields, width: chartWidth(), table: f.typical }) : [];
+    const ctx = f.context || {};
+    const lengths = Insights.cycleLengths(starts, ctx, you);
+    const recent = ctx.perimenopause ? Insights.recentSymptoms(entries, Dates.today()) : null;
+    const extra = [];
+    if (lengths) extra.push(h('div', { class: 'ins-block' }, h('strong', { text: 'Cycle lengths' }), ...lengths.map(t => h('p', { class: 'small', text: t }))));
+    if (ctx.perimenopause) extra.push(h('div', { class: 'ins-block' }, h('strong', { text: 'Transition symptoms, last 30 days' }),
+      h('p', { class: 'small', text: recent || 'None logged yet. The check-in includes night sweats, brain fog, joint aches, heavy flow, palpitations and feeling anxious.' })));
     const labels = { mood: 'Mood', energy: 'Energy', desire: 'Desire', social: 'Social' };
     const whose = you ? 'Yours' : 'Hers';
     const compare = c => {
@@ -771,9 +781,10 @@
       return parts.length ? `${n}. ${whose} runs ${parts.join(', ')}` : `${n}. ${whose} tracks close to typical`;
     };
     const total = charts.reduce((a, c) => a + c.count, 0);
+    const tag = Insights.activeLabel(ctx);
     return {
       title: 'Patterns',
-      aside: you ? 'You vs typical' : `${name} vs typical`,
+      aside: (you ? 'You vs typical' : `${name} vs typical`) + (tag.length ? ` for ${tag[0]}` : ''),
       body: cycle ? [
         h('div', { class: 'keys' },
           h('span', { class: 'key' }, h('i', { style: 'border-top:2px dashed var(--ink-2)' }), 'Typical'),
@@ -781,6 +792,7 @@
         ...charts.map(c => h('div', { class: 'mini-chart' },
           h('div', { class: 'mini-head' }, h('strong', { text: labels[c.field] }), h('span', { class: 'small muted', text: compare(c) })),
           h('div', { html: c.svg }))),
+        ...extra,
         h('p', { class: 'small muted', text: total
           ? 'Each dot is one reading, placed at the same point in the cycle it came from. The solid line is the average. Typical is the same general pattern the meters project from.'
           : `${you ? 'Your' : 'Her'} line appears here as readings are logged. Typical is the general pattern the meters project from.` }),
@@ -788,48 +800,6 @@
     };
   }
 
-
-  // ── Insights: life stage ─────────────────────────────────────────────
-  // The boxes live in the shared settings blob, sealed with the forecast
-  // key, so both people see and can change them and the worker sees nothing.
-  function insightsPanel(f, cycle, entries, you, name) {
-    const ctx = f.context || {};
-    const boxes = Insights.CONTEXTS.map(([id, label, hint]) => {
-      const box = h('input', { type: 'checkbox' });
-      box.checked = !!ctx[id];
-      box.onchange = async () => {
-        box.disabled = true;
-        try {
-          const next = { ...ctx, [id]: box.checked };
-          const r = await Api.settings(f.id, { sharedEnc: await sealShared(f, sharedOf(f, { context: next })) });
-          Object.assign(f, r.forecast); await decorate(f); await render();
-        } catch (e) { box.checked = !box.checked; toast(e.message); }
-        finally { box.disabled = false; }
-      };
-      return h('label', { class: 'row small check ctx' }, box, h('span', {}, h('strong', { text: label }), h('span', { class: 'muted', text: ` ${hint}` })));
-    });
-    const starts = entries.filter(e => e.kind === 'period').map(e => e.date);
-    const sections = Insights.build(ctx, { entries, starts, cycle, you, today: Dates.today() });
-    const body = [
-      h('div', { class: 'ctx-box' },
-        h('p', { class: 'small muted', text: `Check anything that applies to ${you ? 'you' : name}. ${you ? 'You' : 'You and she'} can both see and change these, and they\u2019re encrypted like everything else.` }),
-        ...boxes),
-    ];
-    if (!sections.length) {
-      body.push(h('p', { class: 'muted', text: 'Pick a life stage to see what tends to be different and what the logs show.' }));
-    }
-    for (const sec of sections) {
-      body.push(h('h3', { class: 'ins-head', text: sec.heading }));
-      for (const b of sec.blocks) {
-        body.push(h('div', { class: 'ins-block' + (b.tone === 'care' ? ' care' : '') },
-          h('strong', { text: b.title }),
-          ...(b.paras || []).map(t => h('p', { text: t })),
-          b.list ? h('ul', {}, b.list.map(t => h('li', { text: t }))) : null));
-      }
-    }
-    if (sections.length) body.push(h('p', { class: 'small muted', text: 'General information, not medical advice.' }));
-    return { title: 'Insights', aside: 'Life stage', body };
-  }
 
   // ── hero dial ────────────────────────────────────────────────────────
   function hero(cycle, name, f = {}, entries = []) {
@@ -942,7 +912,7 @@
       h('span', { 'aria-hidden': 'true', text: T.arrow }), h('span', { class: 'sr-hint', text: 'Next few days: ' }), T.word);
   }
 
-  function todayCard(est, showDesire, herTag, name, trends = {}) {
+  function todayCard(est, showDesire, herTag, name, trends = {}, tailored = null) {
     const m = est.meters;
     const note = r => {
       if (!r) return null;
@@ -974,6 +944,7 @@
     else if (sources.has('previous')) foot = `Previous values come from the same point in ${name === 'You' ? 'your' : 'her'} earlier cycles.`;
     if (foot && est.cycle) foot += arrows;
     else if (!foot && arrows) foot = arrows.trim();
+    if (tailored && est.cycle && Object.values(m).some(r => r.source === 'projected')) foot = `${tailored} ${foot || ''}`.trim();
 
     return h('div', { class: 'panel-body' },
       h('div', { class: 'gauges' }, items),
@@ -1227,6 +1198,35 @@
       make, out);
   }
 
+
+  // Life stage, per forecast. Saved in the shared blob (sealed with the
+  // forecast key), so both people see and can change it.
+  function contextSettings(f) {
+    if (f.locked) return null;
+    const you = f.role !== 'owner';
+    const who = you ? 'you' : (f.subjectName || f.label);
+    const ctx = f.context || {};
+    const boxes = Insights.CONTEXTS.map(([id, label, hint]) => {
+      const box = h('input', { type: 'checkbox' });
+      box.checked = !!ctx[id];
+      box.onchange = async () => {
+        box.disabled = true;
+        try {
+          const next = { ...(f.context || {}), [id]: box.checked };
+          const r = await Api.settings(f.id, { sharedEnc: await sealShared(f, sharedOf(f, { context: next })) });
+          Object.assign(f, r.forecast); await decorate(f); await render();
+          toast(box.checked ? `Tailored for ${label.toLowerCase()}` : `${label} removed`);
+        } catch (e) { box.checked = !box.checked; toast(e.message); }
+        finally { box.disabled = false; }
+      };
+      return h('label', { class: 'row small check ctx' }, box, h('span', {}, h('strong', { text: label }), h('span', { class: 'muted', text: ` ${hint}` })));
+    });
+    return h('div', { class: 'ctx-box', style: 'margin-top:20px' },
+      h('strong', { text: you ? 'Your situation' : `${who}\u2019s situation` }),
+      h('p', { class: 'small muted', text: `Tailors the forecast, meters, charts and check-in to anything that applies to ${who}. ${you ? f.ownerName : 'She'} can see and change these too.` }),
+      ...boxes);
+  }
+
   function ownerSettings(f) {
     const parts = [h('h3', { text: f.label })];
     if (!f.locked) {
@@ -1241,7 +1241,7 @@
         });
         Object.assign(f, r.forecast); await decorate(f); renderTabs(); await render(); toast('Saved');
       });
-      parts.push(group('Tab name', label), group('Relationship', rel), saveBtn, ...cycleSettings(f), unlockLinkSection(f));
+      parts.push(group('Tab name', label), group('Relationship', rel), saveBtn, contextSettings(f), ...cycleSettings(f), unlockLinkSection(f));
     }
 
     const danger = [];
@@ -1283,7 +1283,7 @@
     });
     return h('section', { class: 'sheet' },
       h('h3', { text: `Shared with ${f.ownerName}` }),
-      ...cycleSettings(f), unlockLinkSection(f),
+      contextSettings(f), ...cycleSettings(f), unlockLinkSection(f),
       h('div', { style: 'margin-top:20px;display:grid;gap:10px' }, erase, leave));
   }
 

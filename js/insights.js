@@ -1,6 +1,11 @@
 /**
  * insights.js — what changes when a life stage is switched on.
  *
+ * The life stages are checkboxes in Settings. They don't get a panel of
+ * their own: each one feeds the panels that already exist (projections on
+ * Today, the hormone chart and its notes, cycle lengths on Patterns, the
+ * check-in symptoms, the advisory and the next-period estimate).
+ *
  * Plain text only (no markup), so app.js can render it with textContent.
  * Every block says what is generally true and, where her own logs say
  * something, what HER data shows. Nothing here diagnoses; the app cannot
@@ -161,6 +166,108 @@ const Insights = (() => {
     ];
   }
 
+
+  // ── projection tables ────────────────────────────────────────────────
+  // Same shape as TYPICAL in core.js. Each one is flatter than the textbook
+  // cycle, because the textbook phases explain less in these situations.
+  const FLAT = { mood: 'okay', energy: 'yellow', desire: 'yellow', social: 'either' };
+  const TABLES = {
+    // Combined methods usually stop ovulation: no ovulatory peak, just the
+    // break-week bleed.
+    hormonalBC: {
+      menstrual: { ...FLAT, social: 'home' }, follicular: FLAT, ovulation: FLAT, luteal: FLAT, premenstrual: FLAT,
+    },
+    // Sleep loss dominates; social leans home throughout.
+    postpartum: {
+      menstrual: { ...FLAT, social: 'home' }, follicular: { ...FLAT, social: 'home' }, ovulation: { ...FLAT, social: 'home' },
+      luteal: { ...FLAT, social: 'home' }, premenstrual: { ...FLAT, social: 'home' },
+    },
+    // Hormones swing rather than cycle, fatigue is common and desire often
+    // drops, so the follicular lift and ovulatory peak are muted.
+    perimenopause: {
+      menstrual:    { mood: 'okay', energy: 'red',    desire: 'red',    social: 'home' },
+      follicular:   { mood: 'okay', energy: 'yellow', desire: 'yellow', social: 'either' },
+      ovulation:    { mood: 'okay', energy: 'yellow', desire: 'yellow', social: 'either' },
+      luteal:       { mood: 'okay', energy: 'yellow', desire: 'yellow', social: 'either' },
+      premenstrual: { mood: 'okay', energy: 'red',    desire: 'red',    social: 'home' },
+    },
+  };
+  // Birth control decides whether there's a natural cycle at all, so it wins.
+  function projectionTable(ctx = {}) {
+    if (ctx.hormonalBC) return TABLES.hormonalBC;
+    if (ctx.postpartum) return TABLES.postpartum;
+    if (ctx.perimenopause) return TABLES.perimenopause;
+    return null;
+  }
+  function activeLabel(ctx = {}) {
+    return CONTEXTS.filter(([id]) => ctx[id]).map(([, l]) => l.toLowerCase());
+  }
+
+  /** One sentence for under the Today meters when projections are tailored. */
+  function todayNote(ctx = {}, you) {
+    const her = you ? 'your' : 'her';
+    if (ctx.hormonalBC) return 'Tailored for hormonal birth control: projections stay flat, since most methods replace the natural swings.';
+    if (ctx.postpartum) return `Tailored for postpartum: projections stay flat and lean toward staying in, since sleep usually drives things more than the cycle does.`;
+    if (ctx.perimenopause) return `Tailored for perimenopause: projections are flatter and run lower around ${her} period, since hormones swing rather than follow the textbook phases.`;
+    return null;
+  }
+
+  /** Cycle-length summary for the Patterns panel. */
+  function cycleLengths(starts, ctx = {}, you) {
+    const w = words(you);
+    const lens = cycleGaps(starts).slice(-8).map(g => g.days);
+    if (lens.length < 2) {
+      return ctx.perimenopause
+        ? [`Log a few more period starts to see how much ${w.her} cycle varies. In perimenopause, the spread between cycles is the most telling thing to watch.`]
+        : null;
+    }
+    const out = [`Last ${lens.length} cycles: ${lens.join(', ')} days.`];
+    if (!ctx.perimenopause) return out;
+    let maxJump = 0;
+    for (let i = 1; i < lens.length; i++) maxJump = Math.max(maxJump, Math.abs(lens[i] - lens[i - 1]));
+    const jumps7 = lens.slice(1).filter((d, i) => Math.abs(d - lens[i]) >= 7).length;
+    const long60 = lens.filter(d => d >= 60).length;
+    if (long60) out.push(`${long60 === 1 ? 'One gap' : `${long60} gaps`} of 60 days or more. In STRAW+10, the staging system researchers use, a gap that long marks the late menopausal transition, which on average starts about two years before the final period.`);
+    else if (jumps7 >= 2) out.push(`Back-to-back cycles differ by 7 days or more ${jumps7} times. STRAW+10 uses a persistent difference like that to mark the early menopausal transition.`);
+    else if (jumps7 === 1) out.push('One pair of back-to-back cycles differs by 7 days or more. STRAW+10 looks for a difference that persists, so it\u2019s worth watching over the next few cycles.');
+    else out.push(`Back-to-back cycles stay within ${maxJump} days of each other so far. Some people see little change in cycle length right up to their last period.`);
+    out.push('This compares logs to published criteria. It isn\u2019t a diagnosis.');
+    return out;
+  }
+
+  /** Transition-related symptoms logged in the last 30 days, or null. */
+  function recentSymptoms(entries, today) {
+    const since = Dates.add(today, -30);
+    const counts = {};
+    for (const e of entries) {
+      if (e.kind !== 'reading' || e.date < since) continue;
+      for (const s of e.fields?.symptoms || []) if (PERI_SYMPTOMS.includes(s)) counts[s] = (counts[s] || 0) + 1;
+    }
+    const top = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    return top.length ? top.map(([s, n]) => `${Vocab.label('symptoms', s)} \u00d7${n}`).join(', ') : null;
+  }
+
+  /** Collapsible notes for the Hormones panel: what's different, and when to see someone. */
+  function hormoneSections(ctx = {}, data) {
+    const out = [];
+    if (ctx.perimenopause) {
+      const b = perimenopause(data);
+      out.push({ title: 'How perimenopause changes this', list: b.find(x => x.title === 'How it differs from younger cycles').list });
+      out.push({ title: 'Perimenopause: worth raising with a clinician', list: b.find(x => x.tone === 'care').list, tone: 'care' });
+    }
+    if (ctx.hormonalBC) {
+      const b = hormonalBC(data);
+      out.push({ title: 'How birth control changes this', list: b[0].list });
+      out.push({ title: 'Birth control: worth raising with a clinician', list: b[1].list, tone: 'care' });
+    }
+    if (ctx.postpartum) {
+      const b = postpartum(data);
+      out.push({ title: 'How postpartum changes this', list: b[0].list });
+      out.push({ title: 'Postpartum: worth raising with a clinician', list: b[1].list, tone: 'care' });
+    }
+    return out;
+  }
+
   // ── for the advisory and hormone panel ───────────────────────────────
   function advisoryLine(context, partner) {
     if (context.perimenopause) return partner
@@ -179,13 +286,5 @@ const Insights = (() => {
     return null;
   }
 
-  function build(ctx, data) {
-    const out = [];
-    if (ctx.perimenopause) out.push({ heading: 'Perimenopause', blocks: perimenopause(data) });
-    if (ctx.hormonalBC) out.push({ heading: 'Hormonal birth control', blocks: hormonalBC(data) });
-    if (ctx.postpartum) out.push({ heading: 'Postpartum or breastfeeding', blocks: postpartum(data) });
-    return out;
-  }
-
-  return { CONTEXTS, build, advisoryLine, hormoneCaveat };
+  return { CONTEXTS, projectionTable, activeLabel, todayNote, cycleLengths, recentSymptoms, hormoneSections, advisoryLine, hormoneCaveat };
 })();
