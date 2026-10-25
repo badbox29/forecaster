@@ -323,6 +323,11 @@ textarea.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace
 .ins-block ul { margin: 6px 0 0; padding-left: 18px; }
 .ins-block li + li { margin-top: 4px; }
 .ins-block.care { border-left-color: var(--warm); }
+.more { border-top: 1px solid var(--rule); padding-top: 10px; }
+.more > summary { cursor: pointer; font-weight: 600; font-size: 15px; }
+.more.care > summary { color: var(--warm); }
+.more ul { margin: 8px 0 0; padding-left: 18px; }
+.more li + li { margin-top: 4px; }
 .callout { background: var(--cold-sk); border-radius: var(--r-sm); padding: 10px 12px; font-size: 14px; }
 .empty { text-align: center; padding: 8px 0; color: var(--ink-2); }
 
