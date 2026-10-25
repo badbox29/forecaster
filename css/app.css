@@ -235,6 +235,8 @@ details.composer[open] > summary { margin-bottom: 14px; }
 .gate-mark { display: block; width: 48px; height: 48px; }
 .gate-mark svg { width: 100%; height: 100%; }
 .gate-card .btn { width: 100%; }
+.gbtn { display: flex; justify-content: center; min-height: 44px; }
+.gbtn > div { max-width: 100%; }
 .field-group { display: block; }
 .gate-or { text-align: center; color: var(--ink-3); font-size: 14px; }
 .notice { background: var(--cold-sk); border-radius: var(--r-sm); padding: 12px 14px; font-size: 14px; }
