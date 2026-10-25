@@ -39,7 +39,7 @@ Sync runs on a single Cloudflare Worker backed by KV.
 
 ### Panels
 
-Three panels sit under the dial. Move between them with the arrows, the dots,
+Four panels sit under the dial. Move between them with the arrows, the dots,
 the keyboard arrow keys, or a sideways swipe on a phone. A page load always
 opens on Today.
 
@@ -76,6 +76,30 @@ opens on Today.
 Cycles of different lengths line up: early days are matched by days since
 her period started, later days by days until the next one, because the
 second half of a cycle is much steadier than the first.
+
+**Model Guidance**
+
+Her check-ins and your reads of her day are treated as two competing
+forecast models: the **Sweetheart Model** and the **Hubby Model** on partner
+tabs, or named after each of you on family and friend tabs.
+
+- Side-by-side model cards with each model's conditions for today.
+- Today's agreement as a bar and a per-measure verdict: match, close or miss.
+- Your accuracy over 7 and 30 days, with a 30-day chart.
+- A generated **Forecast Discussion**, for example "The Hubby Model has
+  shown a persistent optimism bias on energy over the past week."
+- **Make your call first** (on by default): once her report for today is in,
+  it stays sealed across your whole view until you log your own read, then
+  both are revealed and the app jumps to the comparison.
+- Only **blind calls** count toward accuracy: reads logged before her report
+  existed or while it was sealed. Reads logged after seeing hers are shown
+  but not scored, and blind calls are badged in the log.
+- Her report is always the authority; the score measures how well you read
+  her.
+- **Desire is left out of the comparison** unless she opts in from her own
+  Settings. Her choice is stored as her own entry, which the server stamps
+  with her role, so it can't be switched on for her.
+- Reads you mark *Only me* count on your screen but never appear in hers.
 
 ### Logging
 
@@ -299,6 +323,7 @@ js/vault.js         all cryptography and device key storage
 js/advisory.js      the advisory, her outlook, phase and hormone notes
 js/charts.js        hormone and pattern charts
 js/insights.js      life-stage tailoring
+js/models.js        Model Guidance: agreement, accuracy, discussion
 js/app.js           views, sign-up, invites, settings
 worker/worker.js    Cloudflare Worker
 ```
