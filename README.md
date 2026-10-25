@@ -39,9 +39,19 @@ Sync runs on a single Cloudflare Worker backed by KV.
 
 ### Panels
 
-Four panels sit under the dial. Move between them with the arrows, the dots,
+Panels come in two decks. Move through either with the arrows, the dots,
 the keyboard arrow keys, or a sideways swipe on a phone. A page load always
-opens on Today.
+opens each deck on its first panel.
+
+- **Today and Model Guidance** sit right under the dial and rotate every 10
+  seconds, with a pause/play button and a progress bar. Rotation pauses
+  while the pointer is over the deck, while something inside it has focus,
+  while a finger is on it, while the app is in the background, and while
+  Settings is open. Any manual move stops it until the next load, and it
+  never runs on devices set to reduce motion. Panels swap in place, so
+  rotation never disturbs a form being filled in.
+- **Hormones and Patterns** sit below the advisory, right above the logging
+  forms. Both are for reading, so they only move when you move them.
 
 **Today**
 
@@ -119,7 +129,7 @@ practical, mostly humorous suggestions, for example "Battery in the red. You
 are in charge of dinner, dishes, and anything with stairs." She never sees
 it. On her tab she gets a plain outlook instead.
 
-Partner forecasts include the desire reading and the husband advisory.
+Partner forecasts include the desire reading and the partner advisory.
 Family and friend forecasts leave both out.
 
 ### Her situation
