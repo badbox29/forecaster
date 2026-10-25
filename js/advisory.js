@@ -114,15 +114,7 @@ const Advisory = (() => {
   /** Her own outlook. Plain and useful, no jokes about her. */
   function forSubject({ cycle }) {
     if (!cycle) return { headline: 'Set day one', lines: ['Add the first day of your last period and the forecast starts working.'] };
-    const t = {
-      menstrual:    'Your period. Rest counts as productive.',
-      follicular:   'Energy usually builds through this stretch.',
-      ovulation:    'Around your estimated ovulation window. Estimates only, not contraception.',
-      luteal:       'Second half of your cycle. Energy often settles.',
-      premenstrual: 'Your period is likely in the next few days.',
-      late:         'Past the predicted start. Cycles vary; log it when it arrives.',
-    }[cycle.phase];
-    const lines = [t];
+    const lines = [];
     if (!cycle.late) lines.push(`Next period estimated ${Dates.pretty(cycle.next)}, in ${cycle.daysToNext} ${cycle.daysToNext === 1 ? 'day' : 'days'}.`);
     lines.push(cycle.learned
       ? `Predictions use your logged average of ${cycle.length} days.`
@@ -130,5 +122,44 @@ const Advisory = (() => {
     return { headline: Cycle.PHASES[cycle.phase].name, lines };
   }
 
-  return { forOwner, forSubject };
+
+  /**
+   * What each phase means, in plain words. `front` is the weather-desk
+   * name; `meaning` says what is going on in the body and how it tends to
+   * feel, without promising it will. `you` switches to second person for
+   * her own view.
+   */
+  function phaseNote(phase, you) {
+    const her = you ? 'your' : 'her', she = you ? 'you' : 'she', herSelf = you ? 'you' : 'her';
+    const N = {
+      menstrual: {
+        front: 'Low-pressure system',
+        meaning: `${cap(her)} period. Estrogen and progesterone are at their lowest of the cycle, so energy often dips, and cramps tend to be worst in the first day or two.`,
+      },
+      follicular: {
+        front: 'Clearing skies',
+        meaning: `Estrogen climbs steadily once ${her} period ends. For many people this is when energy and mood lift and plans feel easier.`,
+      },
+      ovulation: {
+        front: 'High-pressure ridge',
+        meaning: `Estrogen peaks and an egg is released, about two weeks before ${her} next period. Desire often runs highest here. These dates are estimates, not birth control.`,
+      },
+      luteal: {
+        front: 'Stable, warming',
+        meaning: `After ovulation, progesterone rises and holds steady, nudging ${her} resting body temperature up a few tenths of a degree. Energy often settles into a calmer, steadier range.`,
+      },
+      premenstrual: {
+        front: 'Front approaching',
+        meaning: `Estrogen and progesterone fall in the last few days before ${her} period. That drop is what brings on PMS for people who get it: tiredness, irritability, cravings, bloating. Plenty of people barely notice it.`,
+      },
+      late: {
+        front: 'Front stalled',
+        meaning: `${cap(her)} period is later than predicted. Cycles often shift by several days with stress, sleep, travel or illness. The forecast resets when ${she} log${you ? '' : 's'} a start.`,
+      },
+    };
+    return N[phase];
+  }
+  const cap = s => s[0].toUpperCase() + s.slice(1);
+
+  return { forOwner, forSubject, phaseNote };
 })();

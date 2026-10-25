@@ -283,4 +283,33 @@ function estimateReadings(entries, starts, meta, subjectId, on = Dates.today()) 
   return { meters: out, cycle, symptoms: logged.symptoms || [] };
 }
 
-if (typeof module !== 'undefined') module.exports = { Dates, Cycle, resolveEntries, readingsFor, Vocab, estimateReadings };
+// Direction each meter is heading over the next few days. Compares today's
+// value (logged or estimated) with the average estimate for days +2 to +4.
+// If that window crosses the predicted next period, the predicted start is
+// treated as real, so the trend sees the new cycle coming. No trend once a
+// period is late: the timing is unknown, so the direction is too.
+const SOCIAL_ORDER = ['home', 'either', 'out'];
+function levelOf(field, v) {
+  return field === 'social' ? SOCIAL_ORDER.indexOf(v) : ORDINAL[field].indexOf(v);
+}
+function trendReadings(entries, starts, meta, subjectId, on = Dates.today()) {
+  const now = estimateReadings(entries, starts, meta, subjectId, on);
+  if (!now.cycle || now.cycle.late) return {};
+  const out = {};
+  const ahead = [2, 3, 4].map(n => {
+    const d = Dates.add(on, n);
+    const s = d >= now.cycle.next ? [...starts, now.cycle.next] : starts;
+    return estimateReadings(entries, s, meta, subjectId, d).meters;
+  });
+  for (const f of ['mood', 'energy', 'desire', 'social']) {
+    const cur = now.meters[f];
+    if (!cur) continue;
+    const later = ahead.map(m => m[f]).filter(Boolean).map(r => levelOf(f, r.value));
+    if (!later.length) continue;
+    const delta = later.reduce((a, b) => a + b, 0) / later.length - levelOf(f, cur.value);
+    out[f] = { dir: delta > 0.34 ? 1 : delta < -0.34 ? -1 : 0 };
+  }
+  return out;
+}
+
+if (typeof module !== 'undefined') module.exports = { Dates, Cycle, resolveEntries, readingsFor, Vocab, estimateReadings, trendReadings };

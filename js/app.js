@@ -592,7 +592,8 @@
     if (!f.subjectId) out.push(inviteCard(f));
     out.push(hero(cycle, herName));
     const starts = entries.filter(e => e.kind === 'period').map(e => e.date);
-    out.push(todayCard(estimateReadings(entries, starts, f, f.subjectId, today), partner, f.subjectId ? 'her' : null, herName));
+    out.push(todayCard(estimateReadings(entries, starts, f, f.subjectId, today), partner, f.subjectId ? 'her' : null, herName,
+      trendReadings(entries, starts, f, f.subjectId, today)));
 
     const adv = Advisory.forOwner({ cycle, readings, relation: f.relation, name: herName, date: today });
     out.push(h('section', { class: 'advisory' + (/Clear|Fair/.test(adv.headline) ? ' fair' : '') },
@@ -660,7 +661,8 @@
     return [
       hero(cycle, null),
       h('section', { class: 'sheet' }, h('h2', { text: 'Your outlook' }), ...o.lines.map(l => h('p', { text: l }))),
-      todayCard(estimateReadings(entries, entries.filter(e => e.kind === 'period').map(e => e.date), f, S.me.id), f.asksDesire, null, 'You'),
+      (() => { const st = entries.filter(e => e.kind === 'period').map(e => e.date);
+        return todayCard(estimateReadings(entries, st, f, S.me.id), f.asksDesire, null, 'You', trendReadings(entries, st, f, S.me.id)); })(),
       composer('Today\u2019s check-in', readingForm({
         showDesire: f.asksDesire, otherName: f.ownerName, defaultVis: 'shared',
         onSave: (fields, body, vis, date) => writeEntry(f, { kind: 'reading', date, fields, body }, vis),
@@ -677,16 +679,16 @@
     const text = h('div', { class: 'hero-text' });
     if (cycle) {
       const ph = Cycle.PHASES[cycle.phase];
+      const note = Advisory.phaseNote(cycle.phase, !name);
       text.append(
-        h('p', { class: 'front', text: ph.front }),
         h('h1', { class: 'phase-name', text: ph.name }),
+        h('p', { class: 'phase-note' }, h('strong', { text: note.front + '. ' }), note.meaning),
         h('p', { class: 'muted', text: `Day ${cycle.day} of about ${cycle.length}, since ${Dates.pretty(cycle.start)}` }),
         h('span', { class: 'next' }, icon('drop'),
           cycle.late ? `Predicted ${Dates.pretty(cycle.next)}, ${-cycle.daysToNext} days ago`
                      : `Next period around ${Dates.pretty(cycle.next)}`));
     } else {
       text.append(
-        h('p', { class: 'front', text: 'Instruments offline' }),
         h('h1', { class: 'phase-name', text: 'No cycle data yet' }),
         h('p', { class: 'muted', text: name
           ? `Log a period start, or wait for ${name} to set day one.`
@@ -764,7 +766,22 @@
 
   // est: result of estimateReadings(). herTag is 'her' on the owner's tab
   // once she has joined, so a logged value can say whose read it was.
-  function todayCard(est, showDesire, herTag, name) {
+  const TREND = {
+    up:     { arrow: '\u2191', word: 'Rising',  cls: 'up' },
+    down:   { arrow: '\u2193', word: 'Dipping', cls: 'down' },
+    flat:   { arrow: '\u2192', word: 'Steady',  cls: 'flat' },
+    sUp:    { arrow: '\u2197', word: 'Outgoing', cls: 'side' },
+    sDown:  { arrow: '\u2198', word: 'Nesting', cls: 'side' },
+  };
+  function trendChip(field, t) {
+    if (!t) return null;
+    const k = t.dir === 0 ? 'flat' : field === 'social' ? (t.dir > 0 ? 'sUp' : 'sDown') : (t.dir > 0 ? 'up' : 'down');
+    const T = TREND[k];
+    return h('div', { class: `trend ${T.cls}`, title: 'Where this is heading over the next few days' },
+      h('span', { 'aria-hidden': 'true', text: T.arrow }), h('span', { class: 'sr-hint', text: 'Next few days: ' }), T.word);
+  }
+
+  function todayCard(est, showDesire, herTag, name, trends = {}) {
     const m = est.meters;
     const note = r => {
       if (!r) return null;
@@ -776,6 +793,7 @@
       visual,
       h('div', { class: 'gauge-label', text: label }),
       h('div', { class: 'gauge-value ' + (r ? 'v-' + r.value : 'v-none'), text: r ? Vocab.label(field, r.value) : 'No reading' }),
+      trendChip(field, trends[field]),
       r ? h('div', { class: 'gauge-by ' + r.source, text: note(r) }) : null);
     const g = (label, field) => {
       const r = m[field];
@@ -789,9 +807,12 @@
 
     const sources = new Set(Object.values(m).map(r => r.source));
     let foot = null;
+    const arrows = Object.keys(trends).length ? ' Arrows show where each meter is heading over the next few days.' : '';
     if (!est.cycle) foot = 'Log a period start and the meters will show projections for each day.';
     else if (sources.has('projected')) foot = `Projected values are broad tendencies for this phase, and people vary a lot. As ${name === 'You' ? 'you log' : `${name} logs`} readings, each meter switches to ${name === 'You' ? 'your' : 'her'} own previous cycles.`;
     else if (sources.has('previous')) foot = `Previous values come from the same point in ${name === 'You' ? 'your' : 'her'} earlier cycles.`;
+    if (foot && est.cycle) foot += arrows;
+    else if (!foot && arrows) foot = arrows.trim();
 
     return h('section', { class: 'sheet' },
       h('div', { class: 'sheet-head' }, h('h2', { text: 'Today' }), h('span', { class: 'small muted', text: Dates.pretty(Dates.today()) })),
