@@ -88,7 +88,7 @@
     const k = S.dataKey && f.wrappedKey ? await Vault.unwrapForecast(S.dataKey, f.wrappedKey, f.id, f.kcv) : null;
     let shared = { ...DEFAULT_SHARED };
     if (k && f.sharedEnc) { try { shared = { ...shared, ...await Vault.open(k.key, f.sharedEnc, `shared:${f.id}`) }; } catch {} }
-    let own = { label: 'Forecast', relation: 'partner' };
+    let own = { label: 'Forecast', relation: 'partner', callFirst: true };
     if (f.role === 'owner' && f.ownerEnc) { try { own = { ...own, ...await Vault.open(S.dataKey, f.ownerEnc, `owner:${f.id}`) }; } catch {} }
     Object.assign(f, { key: k, locked: !k, ...shared, ...(f.role === 'owner' ? own : {}) });
     f.typical = Insights.projectionTable(f.context);   // null = the textbook table
@@ -587,9 +587,23 @@
   }
 
   // ── owner ────────────────────────────────────────────────────────────
-  function ownerView(f, entries) {
-    const cycle = cycleOf(f, entries);
+  // "Make your call first": while her report for today is in and he hasn't
+  // logged his own read, her today readings are held back from every part
+  // of his view, so his read is a real, blind call.
+  function sealState(f, entries, today) {
+    if (!f.subjectId || f.callFirst === false) return false;
+    const hers = entries.some(e => e.kind === 'reading' && e.authorRole === 'subject' && e.date === today);
+    const his = entries.some(e => e.kind === 'reading' && e.authorRole === 'owner' && e.date === today);
+    return hers && !his;
+  }
+
+  function ownerView(f, allEntries) {
     const today = Dates.today();
+    const sealed = sealState(f, allEntries, today);
+    const entries = sealed
+      ? allEntries.filter(e => !(e.kind === 'reading' && e.authorRole === 'subject' && e.date === today))
+      : allEntries;
+    const cycle = cycleOf(f, entries);
     const readings = readingsFor(entries, today, f.subjectId);
     const herName = f.subjectName || f.label;
     const partner = f.relation === 'partner';
@@ -598,11 +612,13 @@
     if (!f.subjectId) out.push(inviteCard(f));
     out.push(hero(cycle, herName, f, entries));
     const starts = entries.filter(e => e.kind === 'period').map(e => e.date);
+    const todayBody = todayCard(estimateReadings(entries, starts, f, f.subjectId, today), partner, f.subjectId ? 'her' : null, herName,
+      trendReadings(entries, starts, f, f.subjectId, today), Insights.todayNote(f.context, false));
     out.push(deck([
-      { title: 'Today', aside: Dates.pretty(today), body: todayCard(estimateReadings(entries, starts, f, f.subjectId, today), partner, f.subjectId ? 'her' : null, herName,
-        trendReadings(entries, starts, f, f.subjectId, today), Insights.todayNote(f.context, false)) },
+      { title: 'Today', aside: Dates.pretty(today), body: sealed ? [sealedBanner(herName), todayBody] : todayBody },
       hormonePanel(cycle, f, false),
       patternPanel(cycle, f, entries, partner, false, herName),
+      modelPanel(f, entries, { you: false, sealed, herName, partner }),
     ]));
 
     const adv = Advisory.forOwner({ cycle, readings, relation: f.relation, name: herName, date: today });
@@ -614,15 +630,109 @@
         : 'Helping you be the one who remembers.' })));
 
     const other = f.subjectId ? f.subjectName : null;
-    out.push(composer(`Log ${herName}\u2019s readings`, readingForm({
+    out.push(composer(sealed ? 'Make your call' : `Log ${herName}\u2019s readings`, readingForm({
       showDesire: partner, peri: !!f.context?.perimenopause, otherName: other, defaultVis: 'shared',
-      onSave: (fields, body, vis, date) => writeEntry(f, { kind: 'reading', date, fields, body }, vis),
-    })));
+      onSave: async (fields, body, vis, date) => {
+        // A call is blind if her report for that date wasn't visible yet.
+        const herVisible = allEntries.some(e => e.kind === 'reading' && e.authorRole === 'subject' && e.date === date);
+        const called = (date === today && sealed) || !herVisible;
+        await writeEntry(f, { kind: 'reading', date, fields: { ...fields, ...(called ? { called: true } : {}) }, body }, vis);
+        if (sealed && date === today) return reveal(f, herName);
+      },
+    }), sealed));
     out.push(composer('Add a note', noteForm({ otherName: other, defaultVis: 'private',
       onSave: (body, vis, date) => writeEntry(f, { kind: 'note', date, body }, vis) })));
     out.push(composer('Log a period start', periodForm(d => writeEntry(f, { kind: 'period', date: d }, 'shared'))));
     out.push(timeline(f, entries));
     return out;
+  }
+
+  function sealedBanner(herName) {
+    return h('div', { class: 'sealed' },
+      h('strong', { text: `${herName}\u2019s report for today is in.` }),
+      h('p', { class: 'small', text: 'Make your call first: log your read of her day, then both are revealed side by side.' }),
+      h('button', { class: 'btn', type: 'button', onclick: () => {
+        const d = [...document.querySelectorAll('details.composer')].find(x => x.querySelector('summary')?.textContent === 'Make your call');
+        if (d) { d.open = true; d.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+      } }, 'Make my call'));
+  }
+
+  // After a blind call, jump to Model Guidance and say how it went.
+  async function reveal(f, herName) {
+    const { entries } = await plainEntries(f);
+    const s = Models.summary(entries, { today: Dates.today(), scoreDesire: Models.desireOptIn(entries) });
+    deckIndex = 3; deckDir = 1;
+    await render();
+    document.querySelector('.deck')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    const t = s.today;
+    if (t.n) {
+      const hits = Object.values(t.per).filter(c => c.agree === 1).length;
+      return `Revealed: you matched ${herName} on ${hits} of ${t.n}.`;
+    }
+    return 'Revealed. Nothing overlapped to compare today.';
+  }
+
+  // ── Model Guidance ───────────────────────────────────────────────────
+  function modelPanel(f, entries, { you, sealed, herName, partner }) {
+    const ownerName = f.ownerName;
+    const herModel = partner ? 'Sweetheart Model' : `${you ? S.me.displayName : herName} Model`;
+    const hisModel = partner ? 'Hubby Model' : `${ownerName} Model`;
+    const title = 'Model Guidance';
+
+    if (!you && !f.subjectId) {
+      return { title, aside: null, body: [h('p', { class: 'muted', text: `Once ${herName} joins, her own check-ins become the ${herModel} and your reads become the ${hisModel}. This panel compares the two.` })] };
+    }
+
+    const scoreDesire = partner && Models.desireOptIn(entries);
+    const today = Dates.today();
+    const s = Models.summary(entries, { today, scoreDesire });
+    const COND = { green: ['Green', 'Favorable conditions', 'v-green'], yellow: ['Yellow', 'Some uncertainty', 'v-yellow'], red: ['Red', 'Stormy', 'v-red'] };
+    const card = (name, sub, cond, sealedHere) => h('div', { class: 'model-card' },
+      h('strong', { text: name }), h('div', { class: 'small muted', text: sub }),
+      sealedHere ? h('div', { class: 'model-cond v-none', text: 'Sealed' })
+        : h('div', { class: 'model-cond ' + (cond ? COND[cond][2] : 'v-none'), text: cond ? COND[cond][0] : 'No report' }),
+      h('div', { class: 'small muted', text: sealedHere ? 'Report in, waiting for your call' : cond ? COND[cond][1] : 'Nothing logged today' }));
+
+    const body = [
+      h('div', { class: 'model-cards' },
+        card(herModel, you ? 'Your check-ins' : 'Self-reported', s.her, sealed),
+        card(hisModel, you ? `${ownerName}\u2019s reads` : 'Your reads', s.his, false)),
+    ];
+
+    // Today's agreement.
+    if (!sealed && s.today.n) {
+      const pct = Math.round(s.today.score * 100);
+      const word = pct === 100 ? 'Agree' : pct >= 50 ? 'Mixed' : 'Split';
+      const mark = a => a === 1 ? '\u2713' : a === 0.5 ? '\u2248' : '\u2717';
+      body.push(h('div', {},
+        h('div', { class: 'mini-head' }, h('strong', { text: 'Model agreement today' }), h('span', { class: 'small', text: `${pct}%, ${word}` })),
+        h('div', { class: 'agree-bar' }, h('i', { style: `width:${pct}%` })),
+        h('div', { class: 'verdicts' }, Object.entries(s.today.per).map(([fld, c]) => h('div', { class: 'verdict' },
+          h('span', { class: 'verdict-mark a' + String(c.agree).replace('.', ''), text: mark(c.agree) }),
+          h('span', { text: { mood: 'Mood', energy: 'Energy', desire: 'Desire', social: 'Social' }[fld] }),
+          h('span', { class: 'small muted', text: `${you ? 'you' : 'her'}: ${Vocab.label(fld, c.her).toLowerCase()}, ${you ? ownerName : 'you'}: ${Vocab.label(fld, c.his).toLowerCase()}` }))))));
+    }
+
+    // Accuracy.
+    const fmt = w => w ? `${Math.round(w.score * 100)}%` : '\u2013';
+    body.push(h('div', { class: 'scores' },
+      h('div', {}, h('div', { class: 'score-num', text: fmt(s.s7) }), h('div', { class: 'small muted', text: s.s7 ? `7 days, ${s.s7.days} scored` : '7 days' })),
+      h('div', {}, h('div', { class: 'score-num', text: fmt(s.s30) }), h('div', { class: 'small muted', text: s.s30 ? `30 days, ${s.s30.days} scored` : '30 days' }))));
+    if (s.series.some(p => p.score != null)) body.push(h('div', { html: Models.chart(s.series, chartWidth()) }));
+
+    // Discussion.
+    const lines = Models.discussion(sealed ? { ...s, hasHer: false } : s, { herModel, hisModel, partner });
+    if (sealed) lines[0] = `The ${herModel} has reported and is sealed. The ${hisModel} must file before the comparison is released.`;
+    body.push(h('div', { class: 'discussion' },
+      h('strong', { text: 'Forecast discussion' }),
+      ...lines.map(l => h('p', { text: l }))));
+
+    const notes = [`The ${herModel} is always the authority. The score measures how closely the reads match, and only blind calls count.`];
+    if (partner) notes.push(scoreDesire ? 'Desire is included in the comparison, by her choice.'
+      : you ? 'Desire isn\u2019t part of the comparison. You can include it in Settings.'
+            : `Desire isn\u2019t part of the comparison. Only ${herName} can include it.`);
+    body.push(h('p', { class: 'small muted', text: notes.join(' ') }));
+    return { title, aside: null, body };
   }
 
   function linkWithKey(params, raw) {
@@ -677,6 +787,7 @@
             body: todayCard(estimateReadings(entries, st, f, S.me.id), f.asksDesire, null, 'You', trendReadings(entries, st, f, S.me.id), Insights.todayNote(f.context, true)) },
           hormonePanel(cycle, f, true),
           patternPanel(cycle, f, entries, f.asksDesire, true, 'You'),
+          modelPanel(f, entries, { you: true, sealed: false, herName: S.me.displayName, partner: !!f.asksDesire }),
         ]); })(),
       composer('Today\u2019s check-in', readingForm({
         showDesire: f.asksDesire, peri: !!f.context?.perimenopause, otherName: f.ownerName, defaultVis: 'shared',
@@ -1020,11 +1131,11 @@
       if (social.getValue()) fields.social = social.getValue();
       if (picked.size) fields.symptoms = [...picked];
       if (!Object.keys(fields).length && !note.value.trim()) return toast('Pick at least one reading.');
-      await onSave(fields, note.value.trim() || null, vis.getValue(), date.value || Dates.today());
+      const msg = await onSave(fields, note.value.trim() || null, vis.getValue(), date.value || Dates.today());
       [mood, energy, desire, social].forEach(s => s.setValue(null));
       picked.clear(); chips.querySelectorAll('.chip').forEach(c => c.setAttribute('aria-pressed', 'false'));
       note.value = '';
-      toast('Readings saved');
+      toast(typeof msg === 'string' ? msg : 'Readings saved');
     });
     return h('div', { class: 'composer-body' },
       group('Mood', mood), group('Energy', energy), showDesire ? group('Desire', desire) : null,
@@ -1064,7 +1175,7 @@
     const me = S.me.id;
     const starts = entries.filter(e => e.kind === 'period').map(e => e.date);
     const groups = new Map();
-    for (const e of entries.slice(0, 120)) {
+    for (const e of entries.filter(x => x.kind !== 'pref').slice(0, 120)) {
       if (!groups.has(e.date)) groups.set(e.date, []);
       groups.get(e.date).push(e);
     }
@@ -1079,6 +1190,7 @@
     const mine = e.authorId === me;
     const meta = h('div', { class: 'entry-meta' }, h('span', { text: authorName(f, e) }));
     if (e.kind === 'period') meta.append(h('span', { class: 'badge period' }, icon('drop'), 'Period started'));
+    if (e.kind === 'reading' && e.authorRole === 'owner' && e.fields?.called) meta.append(h('span', { class: 'badge call', text: 'Blind call' }));
     else meta.append(e.visibility === 'private'
       ? h('span', { class: 'badge private' }, icon('lock'), 'Only you')
       : h('span', { class: 'badge shared' }, icon('eye'), 'Shared'));
@@ -1128,6 +1240,8 @@
   }
   const sealShared = (f, shared) => Vault.seal(f.key.key, shared, `shared:${f.id}`);
   const sealOwner = (fid, own) => Vault.seal(S.dataKey, own, `owner:${fid}`);
+  // The whole owner blob, so saving one field never drops another.
+  const ownOf = (f, patch = {}) => ({ label: f.label, relation: f.relation, callFirst: f.callFirst !== false, ...patch });
 
   function openNewForecast() {
     const label = h('input', { type: 'text', placeholder: 'Wife, Sister, Jess', maxlength: 24 });
@@ -1141,7 +1255,7 @@
       const r = await Api.createForecast({
         id: fid, kcv: k.kcv, wrappedKey: k.wrappedKey,
         sharedEnc: await Vault.seal(k.key, { ...DEFAULT_SHARED, asksDesire: relation === 'partner' }, `shared:${fid}`),
-        ownerEnc: await sealOwner(fid, { label: label.value.trim(), relation }),
+        ownerEnc: await sealOwner(fid, { label: label.value.trim(), relation, callFirst: true }),
       });
       S.forecasts.push(await decorate(r.forecast));
       S.active = fid; Local.set('tab', fid);
@@ -1227,6 +1341,23 @@
       ...boxes);
   }
 
+  // Only she can put desire into the model comparison. Stored as her own
+  // entry, which the server stamps with her role, so it can't be set for her.
+  function desireOptIn(f) {
+    if (f.locked || !f.asksDesire) return null;
+    const box = h('input', { type: 'checkbox' });
+    plainEntries(f).then(r => { box.checked = Models.desireOptIn(r.entries); });
+    box.onchange = async () => {
+      box.disabled = true;
+      try { await writeEntry(f, { kind: 'pref', date: Dates.today(), fields: { scoreDesire: box.checked } }, 'shared'); toast('Saved'); }
+      catch (e) { box.checked = !box.checked; toast(e.message); }
+      finally { box.disabled = false; }
+    };
+    return h('label', { class: 'row small check', style: 'margin-top:12px' }, box,
+      h('span', {}, h('strong', { text: 'Include desire in Model Guidance' }),
+        h('span', { class: 'muted', text: ` Off by default. When on, ${f.ownerName}\u2019s reads of your desire are scored against yours.` })));
+  }
+
   function ownerSettings(f) {
     const parts = [h('h3', { text: f.label })];
     if (!f.locked) {
@@ -1236,12 +1367,25 @@
       saveBtn.onclick = () => busy(saveBtn, async () => {
         const relation = rel.getValue() || f.relation;
         const r = await Api.settings(f.id, {
-          ownerEnc: await sealOwner(f.id, { label: label.value.trim() || f.label, relation }),
+          ownerEnc: await sealOwner(f.id, ownOf(f, { label: label.value.trim() || f.label, relation })),
           sharedEnc: await sealShared(f, sharedOf(f, { asksDesire: relation === 'partner' })),
         });
         Object.assign(f, r.forecast); await decorate(f); renderTabs(); await render(); toast('Saved');
       });
-      parts.push(group('Tab name', label), group('Relationship', rel), saveBtn, contextSettings(f), ...cycleSettings(f), unlockLinkSection(f));
+      const cf = h('input', { type: 'checkbox' });
+      cf.checked = f.callFirst !== false;
+      cf.onchange = async () => {
+        cf.disabled = true;
+        try {
+          const r = await Api.settings(f.id, { ownerEnc: await sealOwner(f.id, ownOf(f, { callFirst: cf.checked })) });
+          Object.assign(f, r.forecast); await decorate(f); await render();
+        } catch (e) { cf.checked = !cf.checked; toast(e.message); }
+        finally { cf.disabled = false; }
+      };
+      const callFirst = h('label', { class: 'row small check', style: 'margin-top:16px' }, cf,
+        h('span', {}, h('strong', { text: 'Make your call first' }),
+          h('span', { class: 'muted', text: ' Hide her report for today until you’ve logged your own read. Reads made after seeing hers don’t count toward accuracy.' })));
+      parts.push(group('Tab name', label), group('Relationship', rel), saveBtn, callFirst, contextSettings(f), ...cycleSettings(f), unlockLinkSection(f));
     }
 
     const danger = [];
@@ -1283,7 +1427,7 @@
     });
     return h('section', { class: 'sheet' },
       h('h3', { text: `Shared with ${f.ownerName}` }),
-      contextSettings(f), ...cycleSettings(f), unlockLinkSection(f),
+      desireOptIn(f), contextSettings(f), ...cycleSettings(f), unlockLinkSection(f),
       h('div', { style: 'margin-top:20px;display:grid;gap:10px' }, erase, leave));
   }
 
