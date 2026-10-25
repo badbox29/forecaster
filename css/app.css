@@ -354,6 +354,7 @@ textarea.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace
 .score-num { font-family: var(--disp); font-weight: 700; font-size: 28px; }
 .discussion { background: var(--sheet-2); border-radius: var(--r-sm); padding: 12px 14px; }
 .discussion > * + * { margin-top: 6px; }
+.badge.update { background: var(--cold-sk); color: var(--cold); }
 .badge.call { background: var(--sun-sk); color: var(--sun); }
 .callout { background: var(--cold-sk); border-radius: var(--r-sm); padding: 10px 12px; font-size: 14px; }
 .empty { text-align: center; padding: 8px 0; color: var(--ink-2); }
