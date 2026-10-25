@@ -676,7 +676,7 @@
   function modelPanel(f, entries, { you, sealed, herName, partner }) {
     const ownerName = f.ownerName;
     const herModel = partner ? 'Sweetheart Model' : `${you ? S.me.displayName : herName} Model`;
-    const hisModel = partner ? 'Hubby Model' : `${ownerName} Model`;
+    const hisModel = partner ? 'Partner Model' : `${ownerName} Model`;
     const title = 'Model Guidance';
 
     if (!you && !f.subjectId) {

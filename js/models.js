@@ -132,7 +132,7 @@ const Models = (() => {
     if (s.hasHer && s.hasHis && t.n) {
       if (t.score === 1) {
         lines.push(`Both models agree on every measure today. Confidence is unusually high.`
-          + (partner ? ' The husband is cautioned against interpreting consensus as authorization.' : ''));
+          + (partner ? ' The partner is cautioned against interpreting consensus as authorization.' : ''));
       } else if (t.score === 0) {
         lines.push(`The ${hisModel} and the ${herModel} disagree on everything today. Meteorologists suspect a calibration issue in the ${hisModel}.`);
       } else {
