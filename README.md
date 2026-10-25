@@ -61,13 +61,13 @@ opens on Today.
 **Model Guidance**
 
 Her check-ins and your reads of her day are treated as two competing
-forecast models: the **Sweetheart Model** and the **Hubby Model** on partner
+forecast models: the **Sweetheart Model** and the **Partner Model** on partner
 tabs, or named after each of you on family and friend tabs.
 
 - Side-by-side model cards with each model's conditions for today.
 - Today's agreement as a bar and a per-measure verdict: match, close or miss.
 - Your accuracy over 7 and 30 days, with a 30-day chart.
-- A generated **Forecast Discussion**, for example "The Hubby Model has
+- A generated **Forecast Discussion**, for example "The Partner Model has
   shown a persistent optimism bias on energy over the past week."
 - **Make your call first** (on by default): once her report for today is in,
   it stays sealed across your whole view until you log your own read, then
