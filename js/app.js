@@ -517,7 +517,7 @@
     const tabs = S.forecasts.map(f => h('button', {
       class: 'tab', role: 'tab', type: 'button', 'aria-selected': String(f.id === S.active),
       onclick: async () => {
-        S.active = f.id; Local.set('tab', f.id); deckIndex = 0;
+        S.active = f.id; Local.set('tab', f.id); resetDecks();
         renderTabs(); await render();
         await refresh(f.id, !S.raw[f.id]);
         await render();
@@ -614,20 +614,20 @@
     const starts = entries.filter(e => e.kind === 'period').map(e => e.date);
     const todayBody = todayCard(estimateReadings(entries, starts, f, f.subjectId, today), partner, f.subjectId ? 'her' : null, herName,
       trendReadings(entries, starts, f, f.subjectId, today), Insights.todayNote(f.context, false));
-    out.push(deck([
+    out.push(deck('now', [
       { title: 'Today', aside: Dates.pretty(today), body: sealed ? [sealedBanner(herName), todayBody] : todayBody },
       modelPanel(f, entries, { you: false, sealed, herName, partner }),
-      hormonePanel(cycle, f, false),
-      patternPanel(cycle, f, entries, partner, false, herName),
-    ]));
+    ], { rotate: true }));
 
     const adv = Advisory.forOwner({ cycle, readings, relation: f.relation, name: herName, date: today });
     out.push(h('section', { class: 'advisory' + (/Clear|Fair/.test(adv.headline) ? ' fair' : '') },
       h('h2', { text: adv.headline }),
       h('ul', {}, [...adv.lines, Insights.advisoryLine(f.context || {}, partner)].filter(Boolean).map(l => h('li', { text: l }))),
       h('p', { class: 'motto', text: partner
-        ? 'Helping husbands navigate the changing climate of marriage, one hormonal front at a time.'
+        ? 'Helping partners navigate the changing climate of a relationship, one hormonal front at a time.'
         : 'Helping you be the one who remembers.' })));
+
+    out.push(deck('ref', [hormonePanel(cycle, f, false), patternPanel(cycle, f, entries, partner, false, herName)]));
 
     const other = f.subjectId ? f.subjectName : null;
     out.push(composer(sealed ? 'Make your call' : `Log ${herName}\u2019s readings`, readingForm({
@@ -661,7 +661,7 @@
   async function reveal(f, herName) {
     const { entries } = await plainEntries(f);
     const s = Models.summary(entries, { today: Dates.today(), scoreDesire: Models.desireOptIn(entries) });
-    deckIndex = 1; deckDir = 1;   // Model Guidance is the second panel
+    holdDeck('now', 1);   // Model Guidance, held so the result doesn't rotate away
     await render();
     document.querySelector('.deck')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     const t = s.today;
@@ -782,13 +782,12 @@
       hero(cycle, null, f, entries),
       h('section', { class: 'sheet' }, h('h2', { text: 'Your outlook' }), ...o.lines.map(l => h('p', { text: l }))),
       (() => { const st = entries.filter(e => e.kind === 'period').map(e => e.date);
-        return deck([
+        return deck('now', [
           { title: 'Today', aside: Dates.pretty(Dates.today()),
             body: todayCard(estimateReadings(entries, st, f, S.me.id), f.asksDesire, null, 'You', trendReadings(entries, st, f, S.me.id), Insights.todayNote(f.context, true)) },
           modelPanel(f, entries, { you: true, sealed: false, herName: S.me.displayName, partner: !!f.asksDesire }),
-          hormonePanel(cycle, f, true),
-          patternPanel(cycle, f, entries, f.asksDesire, true, 'You'),
-        ]); })(),
+        ], { rotate: true }); })(),
+      deck('ref', [hormonePanel(cycle, f, true), patternPanel(cycle, f, entries, f.asksDesire, true, 'You')]),
       composer('Today\u2019s check-in', readingForm({
         showDesire: f.asksDesire, peri: !!f.context?.perimenopause, otherName: f.ownerName, defaultVis: 'shared',
         onSave: (fields, body, vis, date) => writeEntry(f, { kind: 'reading', date, fields, body }, vis),
@@ -801,48 +800,133 @@
   }
 
 
-  // ── the panel deck: Today, Hormones, Patterns ────────────────────────
-  // Always opens on Today after a load. The index lives in memory only, so
-  // it survives re-renders (saving a reading) but not a refresh.
-  let deckIndex = 0, deckDir = 0;
+  // ── panel decks ──────────────────────────────────────────────────────
+  // Two decks per forecast:
+  //   now   Today and Model Guidance. Rotates every 10 seconds.
+  //   ref   Hormones and Patterns. Manual only; both are for reading.
+  //
+  // A deck swaps its own contents in place, never re-rendering the page,
+  // so rotation can't disturb anything being typed elsewhere. Its state
+  // lives here, keyed by deck id, so a re-render (saving a reading, a poll)
+  // picks up where it was. A page load always starts on the first panel.
+  //
+  // Rotation guardrails: a pause/play button and a progress bar; pauses on
+  // hover, focus inside the deck, a finger on it, a hidden tab or an open
+  // Settings sheet; stops for good on any manual navigation (until the next
+  // load); never runs when the device asks for reduced motion.
+  const ROTATE_MS = 10000;
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  const decks = {};    // id → { index, stopped, startedAt, hold, el, show }
 
-  function deck(panels) {
-    deckIndex = Math.min(deckIndex, panels.length - 1);
-    const p = panels[deckIndex];
-    const go = d => { deckDir = d; deckIndex = (deckIndex + d + panels.length) % panels.length; render(); };
+  function deckState(id, rotate) {
+    return decks[id] ||= { index: 0, stopped: !rotate || reducedMotion.matches, elapsed: 0, hold: { hover: false, focus: false, touch: false }, el: null, show: null };
+  }
+  function resetDecks() { for (const k in decks) delete decks[k]; }
+
+  function deck(id, panels, { rotate = false } = {}) {
+    const st = deckState(id, rotate);
+    st.index = Math.min(st.index, panels.length - 1);
+    const canRotate = rotate && !reducedMotion.matches;
+
+    const title = h('h2'), aside = h('span', { class: 'small muted' });
+    const body = h('div', { class: 'deck-body' });
+    const dotBtns = panels.map((q, i) => h('button', {
+      type: 'button', role: 'tab', 'aria-label': q.title, onclick: () => manual(i),
+    }));
+    const progress = h('div', { class: 'deck-progress', 'aria-hidden': 'true' }, h('i'));
+    const playBtn = canRotate ? h('button', { class: 'deck-play', type: 'button', onclick: () => {
+      st.stopped = !st.stopped;
+      st.elapsed = 0;
+      syncPlay();
+    } }) : null;
+
+    function syncPlay() {
+      if (!playBtn) return;
+      playBtn.textContent = st.stopped ? '\u25B6' : '\u275A\u275A';
+      playBtn.setAttribute('aria-label', st.stopped ? 'Start rotating panels' : 'Pause rotating panels');
+      el.classList.toggle('rotating', !st.stopped);
+    }
+
+    function show(i, dir = 0) {
+      st.index = (i + panels.length) % panels.length;
+      const p = panels[st.index];
+      title.textContent = p.title;
+      aside.textContent = p.aside || '';
+      aside.hidden = !p.aside;
+      body.className = 'deck-body' + (dir ? (dir > 0 ? ' in-right' : ' in-left') : '');
+      body.replaceChildren(...[p.body].flat().filter(Boolean));
+      dotBtns.forEach((b, j) => b.setAttribute('aria-selected', String(j === st.index)));
+      st.elapsed = 0;
+    }
+    function manual(i, dir) {
+      st.stopped = true;          // the person chose a panel; stop rotating
+      syncPlay();
+      show(i, dir ?? (i > st.index ? 1 : -1));
+    }
+    const go = d => manual(st.index + d, d);
     const arrow = (d, label, ch) => h('button', { class: 'deck-arrow', type: 'button', 'aria-label': label, onclick: () => go(d) }, ch);
-    const dots = h('div', { class: 'deck-dots', role: 'tablist', 'aria-label': 'Panels' },
-      panels.map((q, i) => h('button', {
-        type: 'button', role: 'tab', 'aria-selected': String(i === deckIndex), 'aria-label': q.title,
-        onclick: () => { deckDir = i > deckIndex ? 1 : -1; deckIndex = i; render(); },
-      })));
 
-    const body = h('div', { class: 'deck-body' + (deckDir ? (deckDir > 0 ? ' in-right' : ' in-left') : '') }, p.body);
-    deckDir = 0;
-
-    const el = h('section', { class: 'sheet deck', tabindex: '-1', 'aria-roledescription': 'carousel' },
+    const el = h('section', { class: 'sheet deck', tabindex: '-1', 'aria-roledescription': 'carousel', 'data-deck': id },
       h('div', { class: 'deck-head' },
         arrow(-1, 'Previous panel', '\u2039'),
-        h('div', { class: 'deck-title' }, h('h2', { text: p.title }), p.aside ? h('span', { class: 'small muted', text: p.aside }) : null),
+        h('div', { class: 'deck-title' }, title, aside),
         arrow(1, 'Next panel', '\u203A')),
-      body, dots);
+      body,
+      h('div', { class: 'deck-foot' },
+        h('div', { class: 'deck-dots', role: 'tablist', 'aria-label': 'Panels' }, dotBtns),
+        playBtn),
+      canRotate ? progress : null);
 
     el.addEventListener('keydown', e => {
       if (e.target.closest('input, textarea')) return;
       if (e.key === 'ArrowLeft') go(-1);
       if (e.key === 'ArrowRight') go(1);
     });
+    el.addEventListener('mouseenter', () => { st.hold.hover = true; });
+    el.addEventListener('mouseleave', () => { st.hold.hover = false; });
+    // Focus on the deck's own controls doesn't hold it; focus on content does.
+    el.addEventListener('focusin', e => { if (e.target !== el && !e.target.closest('.deck-head, .deck-foot')) st.hold.focus = true; });
+    el.addEventListener('focusout', () => { st.hold.focus = false; });
 
     // Swipe: horizontal moves only, so vertical scrolling still works.
     let sx = 0, sy = 0, tracking = false;
-    el.addEventListener('touchstart', e => { const t = e.touches[0]; sx = t.clientX; sy = t.clientY; tracking = true; }, { passive: true });
+    el.addEventListener('touchstart', e => { const t = e.touches[0]; sx = t.clientX; sy = t.clientY; tracking = true; st.hold.touch = true; }, { passive: true });
     el.addEventListener('touchend', e => {
+      st.hold.touch = false;
       if (!tracking) return; tracking = false;
       const t = e.changedTouches[0], dx = t.clientX - sx, dy = t.clientY - sy;
       if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) go(dx < 0 ? 1 : -1);
     }, { passive: true });
+
+    const kept = st.elapsed;
+    show(st.index);
+    st.elapsed = kept;             // a re-render shouldn't restart the clock
+    st.el = el; st.show = show; st.progress = progress.firstChild;
+    syncPlay();
     return el;
   }
+
+  /** Jump a deck to a panel and keep it there (used by the reveal). */
+  function holdDeck(id, index) {
+    const st = deckState(id, true);
+    st.index = index; st.stopped = true;
+  }
+
+  // One clock for every rotating deck. Time only accrues while nothing is
+  // holding the deck, so a pause picks up exactly where it left off.
+  let lastTick = Date.now();
+  setInterval(() => {
+    const now = Date.now(), dt = now - lastTick;
+    lastTick = now;
+    for (const st of Object.values(decks)) {
+      if (!st.el || !st.el.isConnected || !st.progress) continue;
+      const held = st.hold.hover || st.hold.focus || st.hold.touch || document.hidden || !$('overlay').hidden;
+      if (st.stopped) { st.progress.style.width = '0%'; continue; }
+      if (!held) st.elapsed += dt;
+      st.progress.style.width = `${Math.min(100, (st.elapsed / ROTATE_MS) * 100)}%`;
+      if (st.elapsed >= ROTATE_MS) st.show(st.index + 1, 1);
+    }
+  }, 200);
 
   // Inner width of a sheet, so charts draw at real pixel size.
   const chartWidth = () => Math.max(280, ($('main').clientWidth || 390) - 32 - 38);
@@ -1265,7 +1349,7 @@
     openPanel(panelHead('New forecast'),
       h('p', { class: 'muted', text: 'One forecast per person. The tab name is encrypted, so only you can see it.' }),
       group('Tab name', label), group('Relationship', rel),
-      h('p', { class: 'small muted', text: 'Partner forecasts include the desire reading and the husband advisory. Family and friend forecasts leave those out.' }),
+      h('p', { class: 'small muted', text: 'Partner forecasts include the desire reading and the partner advisory. Family and friend forecasts leave those out.' }),
       go);
   }
 
@@ -1541,7 +1625,7 @@
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       const w = $('main')?.clientWidth || 0;
-      if (deckIndex > 0 && Math.abs(w - lastWidth) > 24 && !$('app').hidden) { lastWidth = w; render(); }
+      if (Math.abs(w - lastWidth) > 24 && !$('app').hidden) { lastWidth = w; render(); }
     }, 200);
   });
   document.addEventListener('visibilitychange', tick);
