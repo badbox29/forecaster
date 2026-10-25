@@ -443,7 +443,13 @@
         } catch (e) { toast(e.message); }
       },
     });
-    google.accounts.id.renderButton(host, { theme: 'outline', size: 'large', width: 300, text: mode === 'link' ? 'signin_with' : 'continue_with' });
+    // Google's button is an iframe capped at 400px wide, so it can't stretch
+    // like the other buttons. Fill the row where it fits (phones) and
+    // center it where it doesn't.
+    host.classList.add('gbtn');
+    await new Promise(requestAnimationFrame);
+    const width = Math.round(Math.min(400, Math.max(200, host.clientWidth || 300)));
+    google.accounts.id.renderButton(host, { theme: 'outline', size: 'large', width, text: mode === 'link' ? 'signin_with' : 'continue_with' });
   }
 
   // Returns a function that yields the current token ('' when Turnstile is
