@@ -61,7 +61,7 @@ const Charts = (() => {
     };
   }
 
-  function hormones({ length, period, day, width }) {
+  function hormones({ length, period, day, width, context = {} }) {
     setWidth(width);
     const top = T0 + 12, bottom = B0 - 6;
     const y = v => bottom - v * (bottom - top);
@@ -70,15 +70,32 @@ const Charts = (() => {
       const v = hormoneLevels(d, length);
       for (const k in series) series[k].push([fx(d, length), y(v[k])]);
     }
+    // Perimenopause: a band for how far estrogen can swing, and a lower,
+    // dashed progesterone for cycles that don't ovulate.
+    let band = '', lowP = '';
+    if (context.perimenopause) {
+      const up = [], dn = [];
+      for (let d = 1; d <= length; d += 0.2) {
+        const e = hormoneLevels(d, length).estrogen;
+        up.push([fx(d, length), y(Math.min(1.05, e * 1.45 + 0.05))]);
+        dn.push([fx(d, length), y(Math.max(0.03, e * 0.5))]);
+      }
+      band = `<path d="${path(up)} ${path(dn.reverse()).replace(/^M/, 'L')} Z" style="fill:var(--cold-sk)"/>`;
+      lowP = `<path d="${path(series.progesterone.map(([x, yy]) => [x, bottom - (bottom - yy) * 0.45]))}" fill="none" style="stroke:var(--calm)" stroke-width="2" stroke-dasharray="2 4"/>`;
+    }
     const line = (k, color, w, dash = '') =>
       `<path d="${path(series[k])}" fill="none" style="stroke:var(${color})" stroke-width="${w}" stroke-linejoin="round" stroke-linecap="round"${dash ? ` stroke-dasharray="${dash}"` : ''}/>`;
     return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Typical estrogen, progesterone and LH across a ${length}-day cycle">
       <line x1="${L0}" y1="${bottom}" x2="${R0}" y2="${bottom}" style="stroke:var(--rule)"/>
       <text x="${L0 - 6}" y="${top + 4}" text-anchor="end" font-size="12" style="fill:var(--ink-3)">high</text>
       <text x="${L0 - 6}" y="${bottom}" text-anchor="end" font-size="12" style="fill:var(--ink-3)">low</text>
+      <g opacity="${context.hormonalBC ? .4 : 1}">
+      ${band}
       ${line('lh', '--sun', 2, '4 3')}
       ${line('estrogen', '--cold', 3)}
       ${line('progesterone', '--calm', 3)}
+      ${lowP}
+      </g>
       ${todayLine(day, length, top, bottom)}
       ${phaseStrip(length, period, B0, 8)}
       ${dayAxis(length, B0 + 24)}

@@ -129,7 +129,7 @@ const Advisory = (() => {
    * feel, without promising it will. `you` switches to second person for
    * her own view.
    */
-  function phaseNote(phase, you) {
+  function phaseNote(phase, you, ctx = {}) {
     const her = you ? 'your' : 'her', she = you ? 'you' : 'she', herSelf = you ? 'you' : 'her';
     const N = {
       menstrual: {
@@ -157,6 +157,12 @@ const Advisory = (() => {
         meaning: `${cap(her)} period is later than predicted. Cycles often shift by several days with stress, sleep, travel or illness. The forecast resets when ${she} log${you ? '' : 's'} a start.`,
       },
     };
+    if (ctx.perimenopause && phase === 'late') {
+      N.late.meaning = `${cap(her)} period is later than the usual range. In perimenopause, long gaps and skipped periods are common. The forecast resets when ${she} log${you ? '' : 's'} a start.`;
+    }
+    if (ctx.hormonalBC) {
+      N[phase] = { ...N[phase], meaning: N[phase].meaning + ' With hormonal birth control, this natural pattern may not apply.' };
+    }
     return N[phase];
   }
   const cap = s => s[0].toUpperCase() + s.slice(1);

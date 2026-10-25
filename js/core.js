@@ -181,7 +181,15 @@ const Vocab = {
     ['tender', 'Tenderness'], ['poor_sleep', 'Poor sleep'], ['irritable', 'Irritable'],
     ['acne', 'Breakouts'],
   ],
-  label(field, id) { return (this[field] || []).find(([k]) => k === id)?.[1] || id; },
+  // Offered on the check-in only when perimenopause is switched on.
+  periSymptoms: [
+    ['night_sweats', 'Night sweats'], ['brain_fog', 'Brain fog'], ['joint_aches', 'Joint aches'],
+    ['heavy_flow', 'Heavy flow'], ['palpitations', 'Palpitations'], ['anxious', 'Anxious'],
+  ],
+  label(field, id) {
+    const list = field === 'symptoms' ? [...this.symptoms, ...this.periSymptoms] : (this[field] || []);
+    return list.find(([k]) => k === id)?.[1] || id;
+  },
 };
 
 // Most recent value for each field on a given date. Her own report wins
@@ -202,6 +210,24 @@ function readingsFor(entries, date, subjectId) {
     }
   }
   return out;
+}
+
+// ── Cycle variability ──────────────────────────────────────────────────────
+// Gaps between logged starts, newest last. Unlike the average in
+// Cycle.compute, long gaps are kept here: in perimenopause a 70-day gap is
+// the signal, not a missed log.
+function cycleGaps(starts) {
+  const s = [...new Set(starts)].sort();
+  const out = [];
+  for (let i = 1; i < s.length; i++) out.push({ from: s[i - 1], to: s[i], days: Dates.diff(s[i - 1], s[i]) });
+  return out.filter(g => g.days >= 15);
+}
+
+// Likely window for the next period, from the spread of her recent cycles.
+function nextWindow(cycle, starts) {
+  const g = cycleGaps(starts).slice(-6).map(x => x.days).filter(d => d <= 90);
+  if (g.length >= 2) return { from: Dates.add(cycle.start, Math.min(...g)), to: Dates.add(cycle.start, Math.max(...g)), basis: 'history' };
+  return { from: Dates.add(cycle.start, cycle.length - 7), to: Dates.add(cycle.start, cycle.length + 7), basis: 'default' };
 }
 
 // ── Estimates for today's meters ───────────────────────────────────────────
@@ -317,4 +343,4 @@ function trendReadings(entries, starts, meta, subjectId, on = Dates.today()) {
   return out;
 }
 
-if (typeof module !== 'undefined') module.exports = { Dates, Cycle, resolveEntries, readingsFor, Vocab, estimateReadings, trendReadings };
+if (typeof module !== 'undefined') module.exports = { Dates, Cycle, resolveEntries, readingsFor, Vocab, estimateReadings, trendReadings, cycleGaps, nextWindow };
