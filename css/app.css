@@ -289,6 +289,32 @@ details.composer[open] > summary { margin-bottom: 14px; }
 textarea.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; min-height: 0; }
 .check { gap: 10px; align-items: flex-start; flex-wrap: nowrap; cursor: pointer; }
 .check input { width: 20px; height: 20px; margin: 2px 0 0; flex: none; accent-color: var(--cold); }
+.deck { outline: none; }
+.deck-head { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; }
+.deck-title { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; min-width: 0; }
+.deck-arrow {
+  width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--rule); background: var(--sheet);
+  color: var(--cold); font-size: 22px; line-height: 1; cursor: pointer; display: grid; place-items: center; padding: 0 0 2px;
+}
+.deck-arrow:hover { background: var(--sheet-2); }
+.deck-body > * + * { margin-top: 12px; }
+.panel-body > * + * { margin-top: 12px; }
+.deck-dots { display: flex; justify-content: center; gap: 8px; }
+.deck-dots button { width: 8px; height: 8px; padding: 0; border-radius: 50%; border: 0; background: var(--rule); cursor: pointer; }
+.deck-dots button[aria-selected="true"] { background: var(--cold); width: 22px; border-radius: 4px; }
+@media (prefers-reduced-motion: no-preference) {
+  .deck-body.in-right { animation: deck-in-r .22s ease-out; }
+  .deck-body.in-left  { animation: deck-in-l .22s ease-out; }
+  @keyframes deck-in-r { from { opacity: 0; transform: translateX(24px); } }
+  @keyframes deck-in-l { from { opacity: 0; transform: translateX(-24px); } }
+}
+.chart { width: 100%; height: auto; display: block; }
+.chart text { font-family: var(--body); }
+.keys { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--ink-2); }
+.key { display: inline-flex; align-items: center; gap: 6px; }
+.key i { display: inline-block; width: 18px; }
+.mini-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.mini-chart + .mini-chart { margin-top: 6px; }
 .empty { text-align: center; padding: 8px 0; color: var(--ink-2); }
 
 @media (prefers-reduced-motion: no-preference) {
