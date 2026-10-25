@@ -58,25 +58,6 @@ opens on Today.
   rising, dipping or steady, and outgoing or nesting for social.
 - Symptoms logged today appear as chips.
 
-**Hormones**
-
-- Typical estrogen, progesterone and LH curves drawn for her cycle length,
-  with a phase strip and a line on today.
-- A sentence on what her hormones are doing right now.
-
-**Patterns**
-
-- One small chart per measure over green, yellow and red bands.
-- A dashed line for the typical pattern, and her readings as dots with a
-  solid average line.
-- A short comparison per measure, judged separately before and after
-  ovulation, such as "Hers runs lower after ovulation."
-- Her logged cycle lengths.
-
-Cycles of different lengths line up: early days are matched by days since
-her period started, later days by days until the next one, because the
-second half of a cycle is much steadier than the first.
-
 **Model Guidance**
 
 Her check-ins and your reads of her day are treated as two competing
@@ -100,6 +81,25 @@ tabs, or named after each of you on family and friend tabs.
   Settings. Her choice is stored as her own entry, which the server stamps
   with her role, so it can't be switched on for her.
 - Reads you mark *Only me* count on your screen but never appear in hers.
+
+**Hormones**
+
+- Typical estrogen, progesterone and LH curves drawn for her cycle length,
+  with a phase strip and a line on today.
+- A sentence on what her hormones are doing right now.
+
+**Patterns**
+
+- One small chart per measure over green, yellow and red bands.
+- A dashed line for the typical pattern, and her readings as dots with a
+  solid average line.
+- A short comparison per measure, judged separately before and after
+  ovulation, such as "Hers runs lower after ovulation."
+- Her logged cycle lengths.
+
+Cycles of different lengths line up: early days are matched by days since
+her period started, later days by days until the next one, because the
+second half of a cycle is much steadier than the first.
 
 ### Logging
 
