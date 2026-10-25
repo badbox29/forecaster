@@ -142,15 +142,20 @@ const Cycle = {
     const next   = Dates.add(start, length);
     const late   = day > length;
 
-    let phase;
-    if (day <= period)          phase = 'menstrual';
-    else if (day < ovDay - 1)   phase = 'follicular';
-    else if (day <= ovDay + 1)  phase = 'ovulation';
-    else if (day <= length - 5) phase = 'luteal';
-    else if (!late)             phase = 'premenstrual';
-    else                        phase = 'late';
+    const phase = late ? 'late' : Cycle.phaseOf(day, length, period);
 
     return { start, day, length, period, ovDay, next, late, phase, learned, daysToNext: Dates.diff(on, next) };
+  },
+
+  /** Phase for a day of a cycle of the given length. Shared by the dial,
+   *  the meters and the charts so they can never disagree. */
+  phaseOf(day, length, period = 5) {
+    const ovDay = Math.max(period + 2, length - 14);
+    if (day <= period) return 'menstrual';
+    if (day < ovDay - 1) return 'follicular';
+    if (day <= ovDay + 1) return 'ovulation';
+    if (day <= length - 5) return 'luteal';
+    return 'premenstrual';
   },
 
   PHASES: {

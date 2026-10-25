@@ -161,5 +161,18 @@ const Advisory = (() => {
   }
   const cap = s => s[0].toUpperCase() + s.slice(1);
 
-  return { forOwner, forSubject, phaseNote };
+  /** What the hormones are doing right now, for the hormone panel. */
+  function hormoneNote(phase, you) {
+    const her = you ? 'your' : 'her';
+    return {
+      menstrual:    `Estrogen and progesterone are both at their lowest. Shedding the uterine lining is what the period is.`,
+      follicular:   `Estrogen is climbing as a follicle matures, which often lifts energy. Progesterone stays low.`,
+      ovulation:    `Estrogen has peaked, and a short LH surge triggers ovulation. This is the most fertile point of ${her} cycle.`,
+      luteal:       `Progesterone is near its peak, and estrogen makes a second, smaller rise. Progesterone is what nudges body temperature up.`,
+      premenstrual: `Both hormones are falling toward ${her} next period. That drop is what brings PMS for people who get it.`,
+      late:         `Hormones would normally be falling about now. A late period can shift everything a few days.`,
+    }[phase];
+  }
+
+  return { forOwner, forSubject, phaseNote, hormoneNote };
 })();

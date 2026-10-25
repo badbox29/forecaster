@@ -511,7 +511,7 @@
     const tabs = S.forecasts.map(f => h('button', {
       class: 'tab', role: 'tab', type: 'button', 'aria-selected': String(f.id === S.active),
       onclick: async () => {
-        S.active = f.id; Local.set('tab', f.id);
+        S.active = f.id; Local.set('tab', f.id); deckIndex = 0;
         renderTabs(); await render();
         await refresh(f.id, !S.raw[f.id]);
         await render();
@@ -592,8 +592,12 @@
     if (!f.subjectId) out.push(inviteCard(f));
     out.push(hero(cycle, herName));
     const starts = entries.filter(e => e.kind === 'period').map(e => e.date);
-    out.push(todayCard(estimateReadings(entries, starts, f, f.subjectId, today), partner, f.subjectId ? 'her' : null, herName,
-      trendReadings(entries, starts, f, f.subjectId, today)));
+    out.push(deck([
+      { title: 'Today', aside: Dates.pretty(today), body: todayCard(estimateReadings(entries, starts, f, f.subjectId, today), partner, f.subjectId ? 'her' : null, herName,
+        trendReadings(entries, starts, f, f.subjectId, today)) },
+      hormonePanel(cycle, f, false),
+      patternPanel(cycle, f, entries, partner, false, herName),
+    ]));
 
     const adv = Advisory.forOwner({ cycle, readings, relation: f.relation, name: herName, date: today });
     out.push(h('section', { class: 'advisory' + (/Clear|Fair/.test(adv.headline) ? ' fair' : '') },
@@ -662,7 +666,12 @@
       hero(cycle, null),
       h('section', { class: 'sheet' }, h('h2', { text: 'Your outlook' }), ...o.lines.map(l => h('p', { text: l }))),
       (() => { const st = entries.filter(e => e.kind === 'period').map(e => e.date);
-        return todayCard(estimateReadings(entries, st, f, S.me.id), f.asksDesire, null, 'You', trendReadings(entries, st, f, S.me.id)); })(),
+        return deck([
+          { title: 'Today', aside: Dates.pretty(Dates.today()),
+            body: todayCard(estimateReadings(entries, st, f, S.me.id), f.asksDesire, null, 'You', trendReadings(entries, st, f, S.me.id)) },
+          hormonePanel(cycle, f, true),
+          patternPanel(cycle, f, entries, f.asksDesire, true, 'You'),
+        ]); })(),
       composer('Today\u2019s check-in', readingForm({
         showDesire: f.asksDesire, otherName: f.ownerName, defaultVis: 'shared',
         onSave: (fields, body, vis, date) => writeEntry(f, { kind: 'reading', date, fields, body }, vis),
@@ -672,6 +681,104 @@
       composer('My period started', periodForm(d => writeEntry(f, { kind: 'period', date: d }, 'shared'))),
       timeline(f, entries),
     ];
+  }
+
+
+  // ── the panel deck: Today, Hormones, Patterns ────────────────────────
+  // Always opens on Today after a load. The index lives in memory only, so
+  // it survives re-renders (saving a reading) but not a refresh.
+  let deckIndex = 0, deckDir = 0;
+
+  function deck(panels) {
+    deckIndex = Math.min(deckIndex, panels.length - 1);
+    const p = panels[deckIndex];
+    const go = d => { deckDir = d; deckIndex = (deckIndex + d + panels.length) % panels.length; render(); };
+    const arrow = (d, label, ch) => h('button', { class: 'deck-arrow', type: 'button', 'aria-label': label, onclick: () => go(d) }, ch);
+    const dots = h('div', { class: 'deck-dots', role: 'tablist', 'aria-label': 'Panels' },
+      panels.map((q, i) => h('button', {
+        type: 'button', role: 'tab', 'aria-selected': String(i === deckIndex), 'aria-label': q.title,
+        onclick: () => { deckDir = i > deckIndex ? 1 : -1; deckIndex = i; render(); },
+      })));
+
+    const body = h('div', { class: 'deck-body' + (deckDir ? (deckDir > 0 ? ' in-right' : ' in-left') : '') }, p.body);
+    deckDir = 0;
+
+    const el = h('section', { class: 'sheet deck', tabindex: '-1', 'aria-roledescription': 'carousel' },
+      h('div', { class: 'deck-head' },
+        arrow(-1, 'Previous panel', '\u2039'),
+        h('div', { class: 'deck-title' }, h('h2', { text: p.title }), p.aside ? h('span', { class: 'small muted', text: p.aside }) : null),
+        arrow(1, 'Next panel', '\u203A')),
+      body, dots);
+
+    el.addEventListener('keydown', e => {
+      if (e.target.closest('input, textarea')) return;
+      if (e.key === 'ArrowLeft') go(-1);
+      if (e.key === 'ArrowRight') go(1);
+    });
+
+    // Swipe: horizontal moves only, so vertical scrolling still works.
+    let sx = 0, sy = 0, tracking = false;
+    el.addEventListener('touchstart', e => { const t = e.touches[0]; sx = t.clientX; sy = t.clientY; tracking = true; }, { passive: true });
+    el.addEventListener('touchend', e => {
+      if (!tracking) return; tracking = false;
+      const t = e.changedTouches[0], dx = t.clientX - sx, dy = t.clientY - sy;
+      if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) go(dx < 0 ? 1 : -1);
+    }, { passive: true });
+    return el;
+  }
+
+  // Inner width of a sheet, so charts draw at real pixel size.
+  const chartWidth = () => Math.max(280, ($('main').clientWidth || 390) - 32 - 38);
+
+  function hormonePanel(cycle, f, you) {
+    const length = cycle?.length || f.cycleLength || 28, period = cycle?.period || f.periodLength || 5;
+    const note = cycle && Advisory.hormoneNote(cycle.phase, you);
+    const key = (color, label, dash) => h('span', { class: 'key' },
+      h('i', { style: `border-top:3px ${dash ? 'dashed' : 'solid'} var(${color})` }), label);
+    return {
+      title: 'Hormones',
+      aside: 'Typical pattern',
+      body: [
+        h('div', { html: Charts.hormones({ length, period, day: cycle && !cycle.late ? cycle.day : null, width: chartWidth() }) }),
+        h('div', { class: 'keys' }, key('--cold', 'Estrogen'), key('--calm', 'Progesterone'), key('--sun', 'LH', true)),
+        note ? h('p', { text: note }) : null,
+        h('p', { class: 'small muted', text: `Drawn for ${you ? 'your' : 'her'} ${length}-day cycle, with ovulation about 14 days before the next period. Shapes only: each hormone is scaled to its own peak, and real levels vary from person to person and cycle to cycle.` }),
+      ],
+    };
+  }
+
+  function patternPanel(cycle, f, entries, showDesire, you, name) {
+    const length = cycle?.length || f.cycleLength || 28, period = cycle?.period || f.periodLength || 5;
+    const starts = entries.filter(e => e.kind === 'period').map(e => e.date);
+    const fields = ['mood', 'energy', ...(showDesire ? ['desire'] : []), 'social'];
+    const charts = cycle ? Charts.pattern({ entries, starts, length, period, day: cycle.late ? null : cycle.day, next: cycle.next, fields, width: chartWidth() }) : [];
+    const labels = { mood: 'Mood', energy: 'Energy', desire: 'Desire', social: 'Social' };
+    const whose = you ? 'Yours' : 'Hers';
+    const compare = c => {
+      if (!c.count) return 'No readings yet';
+      const n = `${c.count} reading${c.count > 1 ? 's' : ''}${c.cycles > 1 ? `, ${c.cycles} cycles` : ''}`;
+      if (!c.verdict) return n;
+      const parts = [['before', 'before ovulation'], ['after', 'after ovulation']]
+        .filter(([k]) => c.verdict[k] != null && Math.abs(c.verdict[k]) >= 0.35)
+        .map(([k, when]) => `${c.verdict[k] > 0 ? 'higher' : 'lower'} ${when}`);
+      return parts.length ? `${n}. ${whose} runs ${parts.join(', ')}` : `${n}. ${whose} tracks close to typical`;
+    };
+    const total = charts.reduce((a, c) => a + c.count, 0);
+    return {
+      title: 'Patterns',
+      aside: you ? 'You vs typical' : `${name} vs typical`,
+      body: cycle ? [
+        h('div', { class: 'keys' },
+          h('span', { class: 'key' }, h('i', { style: 'border-top:2px dashed var(--ink-2)' }), 'Typical'),
+          h('span', { class: 'key' }, h('i', { style: 'border-top:3px solid var(--ink)' }), whose)),
+        ...charts.map(c => h('div', { class: 'mini-chart' },
+          h('div', { class: 'mini-head' }, h('strong', { text: labels[c.field] }), h('span', { class: 'small muted', text: compare(c) })),
+          h('div', { html: c.svg }))),
+        h('p', { class: 'small muted', text: total
+          ? 'Each dot is one reading, placed at the same point in the cycle it came from. The solid line is the average. Typical is the same general pattern the meters project from.'
+          : `${you ? 'Your' : 'Her'} line appears here as readings are logged. Typical is the general pattern the meters project from.` }),
+      ] : [h('p', { class: 'muted', text: 'Log a period start to see patterns across the cycle.' })],
+    };
   }
 
   // ── hero dial ────────────────────────────────────────────────────────
@@ -814,8 +921,7 @@
     if (foot && est.cycle) foot += arrows;
     else if (!foot && arrows) foot = arrows.trim();
 
-    return h('section', { class: 'sheet' },
-      h('div', { class: 'sheet-head' }, h('h2', { text: 'Today' }), h('span', { class: 'small muted', text: Dates.pretty(Dates.today()) })),
+    return h('div', { class: 'panel-body' },
       h('div', { class: 'gauges' }, items),
       est.symptoms.length
         ? h('div', { class: 'chips' }, est.symptoms.map(s => h('span', { class: 'chip static', text: Vocab.label('symptoms', s) })))
@@ -1230,6 +1336,15 @@
     } catch {}
   }
   setInterval(tick, 60000);
+  // Charts are drawn at real pixel width, so redraw them when that changes.
+  let resizeTimer, lastWidth = 0;
+  addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      const w = $('main')?.clientWidth || 0;
+      if (deckIndex > 0 && Math.abs(w - lastWidth) > 24 && !$('app').hidden) { lastWidth = w; render(); }
+    }, 200);
+  });
   document.addEventListener('visibilitychange', tick);
 
   boot();
