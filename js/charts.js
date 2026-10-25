@@ -156,7 +156,10 @@ const Charts = (() => {
     const out = [];
     for (const f of fields) {
       const h = 98, top = 8, bottom = 74;
-      const y = v => bottom - (v / 2) * (bottom - top);
+      // Each level sits in the MIDDLE of its band (low in red, medium in
+      // yellow, high in green), rather than on the band edges.
+      const band = (bottom - top) / 3;
+      const y = v => bottom - (v + 0.5) * band;
       const typ = typicalCurve(f, length, period, table || TYPICAL);
       const typPath = path(typ.map((v, i) => [fx(i + 1, length), y(v)]));
 
@@ -182,11 +185,11 @@ const Charts = (() => {
       }
 
       const svg = `<svg class="chart mini" viewBox="0 0 ${W} ${h}" aria-hidden="true">
-        <rect x="${L0}" y="${top}" width="${R0 - L0}" height="${(bottom - top) / 3}" style="fill:var(--calm-sk)"/>
-        <rect x="${L0}" y="${top + (bottom - top) / 3}" width="${R0 - L0}" height="${(bottom - top) / 3}" style="fill:var(--sun-sk)"/>
-        <rect x="${L0}" y="${top + 2 * (bottom - top) / 3}" width="${R0 - L0}" height="${(bottom - top) / 3}" style="fill:var(--warm-sk)"/>
-        <text x="${L0 - 6}" y="${top + 9}" text-anchor="end" font-size="12" style="fill:var(--ink-3)">${FIELDS[f].high}</text>
-        <text x="${L0 - 6}" y="${bottom}" text-anchor="end" font-size="12" style="fill:var(--ink-3)">${FIELDS[f].low}</text>
+        <rect x="${L0}" y="${top}" width="${R0 - L0}" height="${band}" style="fill:var(--calm)" opacity=".2"/>
+        <rect x="${L0}" y="${top + band}" width="${R0 - L0}" height="${band}" style="fill:var(--sun)" opacity=".2"/>
+        <rect x="${L0}" y="${top + 2 * band}" width="${R0 - L0}" height="${band}" style="fill:var(--warm)" opacity=".2"/>
+        <text x="${L0 - 6}" y="${(top + band / 2 + 4).toFixed(1)}" text-anchor="end" font-size="12" style="fill:var(--ink-3)">${FIELDS[f].high}</text>
+        <text x="${L0 - 6}" y="${(bottom - band / 2 + 4).toFixed(1)}" text-anchor="end" font-size="12" style="fill:var(--ink-3)">${FIELDS[f].low}</text>
         <path d="${typPath}" fill="none" style="stroke:var(--ink-2)" stroke-width="2" stroke-dasharray="5 4"/>
         ${dots}${herLine}
         ${todayLine(day, length, top, bottom, false)}
