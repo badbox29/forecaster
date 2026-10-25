@@ -148,7 +148,14 @@ main { max-width: 680px; margin: 0 auto; padding: 20px 16px 80px; display: grid;
 .gauge svg { width: 100px; height: 58px; display: block; margin: 0 auto 4px; }
 .gauge-label { font-size: 13px; color: var(--ink-2); }
 .gauge-value { font-family: var(--disp); font-weight: 600; font-size: 17px; }
-.gauge-by { font-size: 12px; color: var(--ink-3); }
+.gauge-by { font-size: 12px; color: var(--ink-3); margin-top: 2px; }
+.gauge-by.logged { color: var(--ink-2); }
+.gauge-by.previous, .gauge-by.projected {
+  display: inline-block; border: 1px dashed var(--rule); border-radius: 999px; padding: 0 8px;
+}
+.gauge.est { background: transparent; border: 1px dashed var(--rule); }
+.soc-icon { height: 62px; display: grid; place-items: center; font-size: 30px; }
+.gauge.est .soc-icon { color: var(--ink-2); }
 .v-good, .v-green, .v-out  { color: var(--calm); }
 .v-okay, .v-yellow, .v-either { color: var(--sun); }
 .v-rough, .v-red  { color: var(--warm); }
